@@ -1,7 +1,5 @@
 # turnstile-gate
 
-[![build](https://github.com/OWNER/turnstile-gate/actions/workflows/build.yml/badge.svg)](https://github.com/OWNER/turnstile-gate/actions/workflows/build.yml)
-
 一支單檔、零相依的 Go 反向代理，在自架服務前面加一道 **Cloudflare Turnstile** 驗證。
 沒通過驗證的請求碰不到後面的服務；通過後發一張簽章 cookie，之後直接放行。
 
