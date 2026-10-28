@@ -28,16 +28,28 @@ fi
 
 [ -n "$CERT_ID" ] || CERT_ID="$(cat "$ARCHIVE/DEFAULT")"
 DIR="$ARCHIVE/$CERT_ID"
-[ -f "$DIR/fullchain.pem" ] && [ -f "$DIR/privkey.pem" ] || { echo "找不到憑證：$DIR"; exit 1; }
+for f in cert.pem chain.pem privkey.pem; do
+    [ -f "$DIR/$f" ] || { echo "找不到憑證：$DIR/$f"; exit 1; }
+done
 
-NEW="$(cat "$DIR/fullchain.pem" "$DIR/privkey.pem" | sha256sum | cut -d' ' -f1)"
+# DSM 的 fullchain.pem 可能不含網域憑證（雙憑證時只有中繼與根憑證），自己用 cert + chain 組
+FULL="$BASE/fullchain.pem"
+# cert.pem 結尾可能沒有換行，中間補 echo，否則 END/BEGIN 黏在同一行會讀不到網域憑證
+{ cat "$DIR/cert.pem"; echo; cat "$DIR/chain.pem"; } > "$FULL" || exit 1
+
+# 網域憑證與私鑰不成對就不推，免得閘門載入失敗
+CERT_PUB="$(openssl x509 -in "$FULL" -noout -pubkey | sha256sum)"
+KEY_PUB="$(openssl pkey -in "$DIR/privkey.pem" -pubout | sha256sum)"
+[ "$CERT_PUB" = "$KEY_PUB" ] || { echo "cert.pem 與 privkey.pem 不成對：$DIR"; exit 1; }
+
+NEW="$(cat "$FULL" "$DIR/privkey.pem" | sha256sum | cut -d' ' -f1)"
 [ "$NEW" = "$(cat "$STATE" 2>/dev/null)" ] && { echo "憑證未變動"; exit 0; }
 
 SSH_OPTS="-i $KEY -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$BASE/known_hosts"
 
 # 先傳私鑰、再傳 fullchain（閘門以 fullchain 的修改時間判斷是否重新載入）
-scp $SSH_OPTS "$DIR/privkey.pem"   "$RUSER@$ROUTER:$DEST/privkey.pem"   || exit 1
-scp $SSH_OPTS "$DIR/fullchain.pem" "$RUSER@$ROUTER:$DEST/fullchain.pem" || exit 1
+scp $SSH_OPTS "$DIR/privkey.pem" "$RUSER@$ROUTER:$DEST/privkey.pem"   || exit 1
+scp $SSH_OPTS "$FULL"            "$RUSER@$ROUTER:$DEST/fullchain.pem" || exit 1
 
 echo "$NEW" > "$STATE"
 echo "已推送 $(openssl x509 -in "$DIR/cert.pem" -noout -subject -enddate | tr '\n' ' ')"

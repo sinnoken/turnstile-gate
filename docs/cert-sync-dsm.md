@@ -63,7 +63,8 @@ sh dsm-push-cert.sh
 
 ## 運作細節
 
-- 以 `fullchain.pem + privkey.pem` 的 SHA-256 判斷是否變動，沒變就不連線。
+- 不使用 DSM 的 `fullchain.pem`（雙憑證 RSA + ECC 時它只有中繼與根憑證，不含網域憑證），改以 `cert.pem + chain.pem` 自行組成；推送前檢查網域憑證與 `privkey.pem` 成對，不成對就不推。
+- 以組好的 `fullchain.pem + privkey.pem` 的 SHA-256 判斷是否變動，沒變就不連線。
 - 先傳私鑰、再傳 fullchain。閘門以 fullchain 的修改時間判斷是否重新載入；若載入失敗（例如兩個檔案暫時不成對）會繼續使用舊憑證，並在下一分鐘重試。
 - 第一次連線會記錄路由器的 host key 到 `known_hosts`，之後若 host key 改變會拒絕連線。
 

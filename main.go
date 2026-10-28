@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
@@ -15,9 +16,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -81,6 +84,20 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	// 停止容器時會收到 SIGTERM。容器內的 PID 1 不會被訊號的預設動作終止，
+	// Go 最後只能以 exit status 2 結束，所以自己處理：等進行中的請求結束後正常退出
+	done := make(chan struct{})
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM, os.Interrupt)
+		<-sig
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+		close(done)
+	}()
+
+	var err error
 	if certFile != "" && keyFile != "" {
 		cl := &certLoader{}
 		if _, err := cl.get(nil); err != nil {
@@ -88,10 +105,16 @@ func main() {
 		}
 		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: cl.get}
 		log.Printf("HTTPS on %s → %s", listen, upstream)
-		log.Fatal(srv.ListenAndServeTLS("", ""))
+		err = srv.ListenAndServeTLS("", "")
+	} else {
+		log.Printf("HTTP on %s → %s (no cert configured)", listen, upstream)
+		err = srv.ListenAndServe()
 	}
-	log.Printf("HTTP on %s → %s (no cert configured)", listen, upstream)
-	log.Fatal(srv.ListenAndServe())
+	if err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+	<-done
+	log.Printf("shutdown")
 }
 
 // ---------- 憑證：檔案有變動就重新載入（每分鐘最多檢查一次） ----------

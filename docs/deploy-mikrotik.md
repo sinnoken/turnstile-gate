@@ -31,9 +31,10 @@
 
 ### 2. 取得映像
 
-從 [Releases](https://github.com/OWNER/turnstile-gate/releases) 下載對應架構的 `turnstile-gate-<arch>.tar`，上傳到外接碟根目錄（例如 `usb1/`）。
+預設由路由器直接從 GHCR 拉 `ghcr.io/sinnoken/turnstile-gate:latest`（多架構，RouterOS 會自動選對的），不用另外下載。
+GHCR 套件須設為 **Public**，路由器才能匿名下載。
 
-也可以自己打包：
+路由器無法連 GHCR 時，改用 tar：從 [Releases](https://github.com/sinnoken/turnstile-gate/releases) 下載對應架構的 `turnstile-gate-<arch>.tar`，上傳到外接碟根目錄，並把 rsc 的 `/container/add remote-image=$image check-certificate=yes` 改成 `file="$disk/turnstile-gate-arm64.tar"`。也可以自己打包：
 
 ```bash
 docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-arm64.tar .
@@ -46,7 +47,7 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 ```
 :local nasIP   "192.168.88.10"
 :local disk    "usb1"
-:local image   "turnstile-gate-arm64.tar"
+:local image   "ghcr.io/sinnoken/turnstile-gate:latest"
 :local siteKey "0x4AAAA..."
 :local secret  "0x4AAAA..."
 :local gateKey "<openssl rand -hex 32>"
@@ -75,10 +76,32 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 
 ### 4. 放入憑證並啟動
 
-建立 `usb1/gate/cert/`，放入 `fullchain.pem` 與 `privkey.pem`（或用 [DSM 自動推送](cert-sync-dsm.md)），然後：
+建立 `usb1/gate/cert/`，放入 `fullchain.pem` 與 `privkey.pem`。長期請用 [DSM 自動推送](cert-sync-dsm.md)；第一次測試可以手動從 DSM 匯出：
+
+1. **控制台 → 安全性 → 憑證** → 選網域憑證 → **動作 → 匯出憑證**，解壓縮 zip。
+2. 在解壓縮的資料夾執行（WSL 或 Git Bash）：
+
+   ```bash
+   { cat ECC-cert.pem; echo; cat ECC-chain.pem; } > fullchain.pem
+   cp ECC-privkey.pem privkey.pem
+   openssl x509 -in fullchain.pem -noout -subject              # 必須是你的網域
+   openssl x509 -in fullchain.pem -noout -pubkey | openssl sha256
+   openssl pkey -in privkey.pem -pubout | openssl sha256       # 兩個雜湊必須相同
+   ```
+
+   zip 裡沒有 `ECC-*` 檔案（沒開雙憑證）時，改用 `cert.pem`、`chain.pem`、`privkey.pem`。
+
+3. 把 `fullchain.pem`、`privkey.pem` 用 WinBox / WebFig 的 **Files** 上傳到 `usb1/gate/cert/`。
+
+> **容易出錯的地方**
+> - **不要用 zip 裡的 `fullchain.pem`**：雙憑證時它只有中繼與根憑證，沒有網域憑證。
+> - **中間的 `echo` 不能省**：DSM 的 cert 檔結尾沒有換行，直接 `cat` 會讓 `END`／`BEGIN` 黏在同一行，第一張憑證讀不到。
+> - **cert、chain、privkey 要同一組**：`ECC-*` 配 `ECC-*`，`RSA-*`（＝無前綴的 `cert.pem`／`privkey.pem`）配 `RSA-*`，不能混用。
+
+接著：
 
 ```
-/container/print            # 等 status 變成 stopped（解壓完成）
+/container/print            # 等 status 變成 stopped（下載與解壓完成）
 /container/start [find comment="gate"]
 /log/print where topics~"container"
 ```
@@ -113,8 +136,10 @@ NAT 規則只比對 `in-interface-list=WAN`，在家裡用網域連線不會被�
 
 | 症狀 | 可能原因 |
 |---|---|
-| 匯入時參數錯誤 | RouterOS 小版本之間 `/container/envs`（`name=` / `list=`）、`/container/mounts` 參數名稱有變動，依錯誤訊息調整 |
+| 匯入時參數錯誤 | 本設定檔依 RouterOS 7.24+ 語法（`list=`、`envlists=`、`mountlists=`、`memory-high=`）；較舊版本的參數名稱不同（`name=`、`envlist=`、`mounts=`、`ram-high=`），依錯誤訊息調整 |
+| 拉映像失敗（status 一直是 error 或卡在 downloading） | GHCR 套件不是 Public；路由器本身 DNS 或對外連線有問題；外接碟空間不足 |
 | 容器啟動後立刻停止，log 有 `load cert` | 憑證檔不存在或路徑錯誤 |
+| log 有 `private key does not match public key` | `fullchain.pem` 第一張不是網域憑證，或 cert 與 key 不同組。用 `openssl x509 -in fullchain.pem -noout -subject` 檢查，依[第 4 步](#4-放入憑證並啟動)重新合併 |
 | log 有 `permission denied` | 映像以 UID 65534 執行，掛載檔案權限不足。可在 Dockerfile 移除 `USER 65534` 重新打包 |
 | 驗證頁出現但一直失敗，log 有 `siteverify error` | 容器連不到外網：檢查 masquerade 是否涵蓋 `172.17.0.0/24`、DNS 是否可用（`/ip/dns` 的 `allow-remote-requests=yes`） |
 | Turnstile 元件顯示錯誤 | Turnstile 後台沒加入此網域 |
@@ -125,8 +150,8 @@ NAT 規則只比對 `in-interface-list=WAN`，在家裡用網域連線不會被�
 ```
 /container/stop [find comment="gate"]
 /container/remove [find comment="gate"]
-/container/envs/remove [find name="gate"]
-/container/mounts/remove [find name="gate-cert"]
+/container/envs/remove [find list="gate"]
+/container/mounts/remove [find list="gate-cert"]
 /ip/firewall/filter/remove [find comment~"gate"]
 /ip/firewall/nat/remove [find comment~"gate"]
 /user/remove [find name="gatecert"]

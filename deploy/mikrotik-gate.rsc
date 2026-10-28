@@ -5,7 +5,7 @@
 {
 :local nasIP   "192.168.88.10"      ;# NAS 的內網 IP
 :local disk    "usb1"               ;# /disk print 看外接碟名稱
-:local image   "turnstile-gate-arm64.tar"   ;# Release 下載的 tar，放在外接碟根目錄
+:local image   "ghcr.io/sinnoken/turnstile-gate:latest"   ;# 路由器直接從 GHCR 拉映像
 :local siteKey "0x4AAAA_SITEKEY"
 :local secret  "0x4AAAA_SECRET"
 :local gateKey "REPLACE_WITH_openssl_rand_hex_32"
@@ -58,20 +58,20 @@
     comment="gate: DSM cert push (key login only)"
 
 # ---------- 6. 容器 ----------
-/container/config/set ram-high=128M tmpdir="$disk/tmp"
-/container/envs/add name=gate key=TURNSTILE_SITEKEY value=$siteKey
-/container/envs/add name=gate key=TURNSTILE_SECRET  value=$secret
-/container/envs/add name=gate key=GATE_KEY          value=$gateKey
-/container/envs/add name=gate key=UPSTREAM          value="https://$nasIP:5001"
-/container/envs/add name=gate key=UPSTREAM_INSECURE value="1"
-/container/envs/add name=gate key=CERT_FILE         value="/cert/fullchain.pem"
-/container/envs/add name=gate key=KEY_FILE          value="/cert/privkey.pem"
-/container/envs/add name=gate key=SESSION_HOURS     value="12"
-/container/mounts/add name=gate-cert src="$disk/gate/cert" dst=/cert
-/container/add file="$disk/$image" interface=veth-gate envlist=gate \
-    mounts=gate-cert root-dir="$disk/gate/root" dns=172.17.0.1 \
+/container/config/set memory-high=128M tmpdir="$disk/tmp"
+/container/envs/add list=gate key=TURNSTILE_SITEKEY value=$siteKey
+/container/envs/add list=gate key=TURNSTILE_SECRET  value=$secret
+/container/envs/add list=gate key=GATE_KEY          value=$gateKey
+/container/envs/add list=gate key=UPSTREAM          value="https://$nasIP:5001"
+/container/envs/add list=gate key=UPSTREAM_INSECURE value="1"
+/container/envs/add list=gate key=CERT_FILE         value="/cert/fullchain.pem"
+/container/envs/add list=gate key=KEY_FILE          value="/cert/privkey.pem"
+/container/envs/add list=gate key=SESSION_HOURS     value="12"
+/container/mounts/add list=gate-cert src="$disk/gate/cert" dst=/cert mode=ro
+/container/add remote-image=$image check-certificate=yes interface=veth-gate envlists=gate \
+    mountlists=gate-cert root-dir="$disk/gate/root" dns=172.17.0.1 \
     logging=yes start-on-boot=yes comment="gate"
 
-:put "OK。等 /container/print 顯示 stopped 後，且憑證已推送，再執行："
+:put "OK。等 /container/print 顯示 stopped（下載與解壓完成）後，且憑證已推送，再執行："
 :put "/container/start [find comment=\"gate\"]"
 }
