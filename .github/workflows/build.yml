@@ -1,0 +1,114 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: CGO_ENABLED=0 go build -o /dev/null .
+
+  # 多架構映像推到 GHCR（PR 只建置不推送）
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # RouterOS 拉映像時不認得 attestation manifest，關掉
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 給 RouterOS /container/add file=... 用的 docker-archive tar
+  routeros-tar:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - platform: linux/arm64
+            name: arm64
+          - platform: linux/arm/v7
+            name: armv7
+          - platform: linux/amd64
+            name: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          tags: turnstile-gate:${{ github.ref_name }}
+          outputs: type=docker,dest=turnstile-gate-${{ matrix.name }}.tar
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+      - run: sha256sum turnstile-gate-${{ matrix.name }}.tar > turnstile-gate-${{ matrix.name }}.tar.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnstile-gate-${{ matrix.name }}
+          path: turnstile-gate-${{ matrix.name }}.tar*
+          retention-days: 14
+
+  # 打 tag（v1.2.3）時建立 Release，附上各架構 tar
+  release:
+    needs: [image, routeros-tar]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

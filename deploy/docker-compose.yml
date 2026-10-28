@@ -1,0 +1,21 @@
+# 一般 Docker 主機（例如 NAS 的 Container Manager）用。
+# MikroTik RouterOS 請改看 docs/deploy-mikrotik.md
+services:
+  gate:
+    image: ghcr.io/OWNER/turnstile-gate:latest   # 或改成 build: ..
+    restart: unless-stopped
+    ports:
+      - "8443:8443"          # 路由器：WAN 443 → 這台 8443
+    volumes:
+      - ./cert:/cert:ro      # fullchain.pem、privkey.pem
+    environment:
+      TURNSTILE_SITEKEY: "0x4AAAA..."
+      TURNSTILE_SECRET: "0x4AAAA..."
+      GATE_KEY: "openssl rand -hex 32 產生的字串"
+      UPSTREAM: "https://192.168.1.10:5001"
+      UPSTREAM_INSECURE: "1"   # 上游為自簽憑證時
+      CERT_FILE: "/cert/fullchain.pem"
+      KEY_FILE: "/cert/privkey.pem"
+      SESSION_HOURS: "12"
+      # BYPASS_PREFIXES: "/webdav/"
+      # TRUST_CF_HEADER: "1"   # 僅在 Cloudflare 代理/Tunnel 後方時開啟

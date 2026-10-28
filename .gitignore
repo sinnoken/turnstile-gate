@@ -1,0 +1,6 @@
+/turnstile-gate
+*.tar
+*.tar.sha256
+cert/
+deploy/cert/
+id_gate*
