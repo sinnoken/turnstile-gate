@@ -57,8 +57,6 @@ docker run -d --name turnstile-gate -p 8443:8443 \
   -e UPSTREAM=https://192.168.1.10:5001 \
   -e UPSTREAM_SERVER_NAME=你的網域 \
   -e ALLOWED_HOSTS=你的網域 \
-  -e CERT_FILE=/cert/fullchain.pem \
-  -e KEY_FILE=/cert/privkey.pem \
   ghcr.io/sinnoken/turnstile-gate:latest
 ```
 
@@ -84,11 +82,11 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 | `UPSTREAM_SERVER_NAME` | | | 以這個網域名稱驗證後端憑證（`UPSTREAM` 用 IP、後端憑證是網域憑證時，例：DSM 的 Let's Encrypt 憑證）。設定後忽略 `UPSTREAM_INSECURE` |
 | `ALLOWED_HOSTS` | | 不檢查 | 允許的網域，逗號分隔，不分大小寫、忽略 port。其他 `Host`（例如直接打 IP 的掃描器）一律回 `404`。**建議設定** |
 | `LISTEN` | | `:8443` | 監聽位址 |
-| `CERT_FILE` / `KEY_FILE` | | | PEM 憑證與私鑰。兩者都設才啟用 HTTPS，否則以 HTTP 監聽 |
+| `CERT_FILE` / `KEY_FILE` | | `/cert/fullchain.pem` / `/cert/privkey.pem` | PEM 憑證與私鑰。兩者都沒設時，若 `/cert` 下有這兩個檔就自動使用；都找不到則以 HTTP 監聽 |
 | `SESSION_HOURS` | | `12` | 通過驗證後 cookie 有效時數 |
 | `BYPASS_PREFIXES` | | | 免驗證的路徑前綴，逗號分隔，例：`/webdav/`（建議以 `/` 結尾）。解碼後含 `..` 片段的路徑（例：`/webdav/%2e%2e/...`）不放行 |
 | `TRUST_CF_HEADER` | | 關 | `1` = 信任 `CF-Connecting-IP`。**只在 Cloudflare 代理或 Tunnel 後方開啟**，直接對外時此標頭可被偽造 |
-| `GOMEMLIMIT` | | | Go runtime 的記憶體軟上限，記憶體有限的設備（路由器）建議 `48MiB` |
+| `GOMEMLIMIT` | | `48MiB` | Go runtime 的記憶體軟上限（映像預設值） |
 
 ### 端點
 

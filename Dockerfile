@@ -11,5 +11,7 @@ FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /gate /gate
 USER 65534
+# 路由器等記憶體有限的環境；需要時可用環境變數覆寫
+ENV GOMEMLIMIT=48MiB
 EXPOSE 8443
 ENTRYPOINT ["/gate"]

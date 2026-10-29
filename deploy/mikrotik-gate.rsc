@@ -72,10 +72,7 @@
 /container/envs/add list=gate key=UPSTREAM          value="https://$nasIP:5001"
 /container/envs/add list=gate key=UPSTREAM_SERVER_NAME value=$domain
 /container/envs/add list=gate key=ALLOWED_HOSTS     value=$domain
-/container/envs/add list=gate key=GOMEMLIMIT        value="48MiB"
-/container/envs/add list=gate key=CERT_FILE         value="/cert/fullchain.pem"
-/container/envs/add list=gate key=KEY_FILE          value="/cert/privkey.pem"
-/container/envs/add list=gate key=SESSION_HOURS     value="12"
+# 憑證（/cert/fullchain.pem、/cert/privkey.pem）、GOMEMLIMIT=48MiB、SESSION_HOURS=12 都是映像的預設值
 /container/mounts/add list=gate-cert src="$disk/gate/cert" dst=/cert mode=ro
 /container/add remote-image=$image check-certificate=yes interface=veth-gate envlists=gate \
     mountlists=gate-cert root-dir="$disk/gate/root" dns=172.17.0.1 \

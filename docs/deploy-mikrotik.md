@@ -157,8 +157,9 @@ envs、掛載、網路與開機自動啟動都會保留，只換映像。新版�
 /container/envs/remove [find list="gate" key="UPSTREAM_INSECURE"]
 /container/envs/add list=gate key=UPSTREAM_SERVER_NAME value="你的網域"
 /container/envs/add list=gate key=ALLOWED_HOSTS        value="你的網域"
-/container/envs/add list=gate key=GOMEMLIMIT           value="48MiB"
 ```
+
+`CERT_FILE`、`KEY_FILE`、`SESSION_HOURS`、`GOMEMLIMIT` 若與預設值相同（`/cert/fullchain.pem`、`/cert/privkey.pem`、`12`、`48MiB`），可以刪掉不設。
 
 ## 疑難排解
 

@@ -7,7 +7,8 @@
 | 狀態 | 項目 |
 |:-:|---|
 | ✅ | F6／§3.6 `UPSTREAM_SERVER_NAME`（`a79bdd2`）；`.rsc` 加 `domain`、刪 `UPSTREAM_INSECURE`；compose 改用 `UPSTREAM_SERVER_NAME` |
-| ✅ | §3.8／compose 加 `ALLOWED_HOSTS`、`GOMEMLIMIT`；`go.mod` 改 `go 1.25` |
+| ✅ | §3.8／compose 加 `ALLOWED_HOSTS`；`GOMEMLIMIT=48MiB` 改為 Dockerfile 的 `ENV` 預設；`go.mod` 改 `go 1.25` |
+| ✅ | 預設值：`CERT_FILE`／`KEY_FILE` 都沒設時自動使用 `/cert/fullchain.pem`、`/cert/privkey.pem`（存在才用）；`.rsc` 與 compose 拿掉與預設值相同的設定 |
 | ⚠️ | `ALLOWED_HOSTS` 的 Host 檢查已實作（不符回 `404`，`allowedHost()`），但還沒有 `bad_host` 事件與封鎖，等封鎖機制接上 |
 | ❌ | 封鎖機制 F1～F5、slog、body 上限、HSTS、`config`、`gate_test.go`、CI 排程與 `go test`／`govulncheck`、`docs/blocking.md`、`CHANGES-blocking.md`、U6 |
 
@@ -227,7 +228,7 @@ func (l blockListener) Accept() (net.Conn, error) {
 
 ### 3.8 RouterOS（`.rsc`）
 
-✅ 已完成：`domain` 變數、`UPSTREAM_SERVER_NAME`、`ALLOWED_HOSTS`、`GOMEMLIMIT`，並刪除 `UPSTREAM_INSECURE`（RouterOS 7.24+ 語法 `list=`）。
+✅ 已完成：`domain` 變數、`UPSTREAM_SERVER_NAME`、`ALLOWED_HOSTS`，並刪除 `UPSTREAM_INSECURE`（RouterOS 7.24+ 語法 `list=`）。`GOMEMLIMIT` 改由映像預設，`.rsc` 不再設定。
 
 已部署的路由器不重新匯入，改為 `stop` → 調整 envs → `repull` → `start`（指令見 `docs/deploy-mikrotik.md`「更新映像」）。
 
@@ -238,7 +239,7 @@ func (l blockListener) Accept() (net.Conn, error) {
 | `ALLOWED_HOSTS` | 不檢查 | ✅ Host 檢查已完成（不符回 404）。允許的網域，逗號分隔，不分大小寫，去掉 port。**強烈建議設定**，否則 `bad_host` 不會生效 |
 | `UPSTREAM_SERVER_NAME` | 無 | ✅ 已完成。驗證上游憑證時使用的網域名稱。設定後忽略 `UPSTREAM_INSECURE` |
 | `LOG_LEVEL` | `info` | `debug` 時逐筆記錄請求 |
-| `GOMEMLIMIT` | 無 | ✅ 已寫進 `.rsc`、compose。Go runtime 內建，建議 `48MiB` |
+| `GOMEMLIMIT` | `48MiB` | ✅ Dockerfile 以 `ENV` 設為預設，可用環境變數覆寫。Go runtime 內建 |
 
 ### 3.10 日誌格式
 

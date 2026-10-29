@@ -33,9 +33,8 @@ var (
 	gateKey   = []byte(mustEnv("GATE_KEY")) // 隨機長字串，用來簽 cookie
 	upstream  = mustURL(mustEnv("UPSTREAM")) // 例：https://192.168.1.10:5001
 	listen    = envOr("LISTEN", ":8443")
-	// 匯入的憑證（PEM）。兩個都設就啟用 HTTPS；檔案更新後會自動重新載入
-	certFile = os.Getenv("CERT_FILE")
-	keyFile  = os.Getenv("KEY_FILE")
+	// 匯入的憑證（PEM）。兩個都有就啟用 HTTPS；檔案更新後會自動重新載入
+	certFile, keyFile = certPaths()
 	// 只有在 Cloudflare 後面時才設 1；直接對外時這個標頭可被偽造
 	trustCF = os.Getenv("TRUST_CF_HEADER") == "1"
 	ttl       = time.Duration(envInt("SESSION_HOURS", 12)) * time.Hour
@@ -349,6 +348,22 @@ func hasDotDot(p string) bool {
 		}
 	}
 	return false
+}
+
+// CERT_FILE、KEY_FILE 都沒設時，若掛載了 /cert/fullchain.pem 與 /cert/privkey.pem 就直接使用
+func certPaths() (string, string) {
+	c, k := os.Getenv("CERT_FILE"), os.Getenv("KEY_FILE")
+	if c != "" || k != "" {
+		return c, k
+	}
+	const dc, dk = "/cert/fullchain.pem", "/cert/privkey.pem"
+	if _, err := os.Stat(dc); err != nil {
+		return "", ""
+	}
+	if _, err := os.Stat(dk); err != nil {
+		return "", ""
+	}
+	return dc, dk
 }
 
 // 沒設 ALLOWED_HOSTS 時不檢查；比對時去掉 port、不分大小寫

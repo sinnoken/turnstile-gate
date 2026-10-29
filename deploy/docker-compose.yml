@@ -16,9 +16,10 @@ services:
       UPSTREAM_SERVER_NAME: "你的網域"   # 以網域驗證後端憑證（DSM 已套用該網域憑證時）
       # UPSTREAM_INSECURE: "1"  # 後端只有自簽憑證時才改用這行（不驗證憑證）
       ALLOWED_HOSTS: "你的網域"   # 其他 Host（直接打 IP 的掃描器）回 404
-      GOMEMLIMIT: "48MiB"
-      CERT_FILE: "/cert/fullchain.pem"
-      KEY_FILE: "/cert/privkey.pem"
-      SESSION_HOURS: "12"
+      # 以下為預設值，需要時才設：
+      # CERT_FILE: "/cert/fullchain.pem"   # 與 KEY_FILE 都沒設時，/cert 下有這兩個檔就自動使用
+      # KEY_FILE: "/cert/privkey.pem"
+      # SESSION_HOURS: "12"
+      # GOMEMLIMIT: "48MiB"
       # BYPASS_PREFIXES: "/webdav/"
       # TRUST_CF_HEADER: "1"   # 僅在 Cloudflare 代理/Tunnel 後方時開啟
