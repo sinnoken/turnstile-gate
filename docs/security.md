@@ -33,7 +33,10 @@
 - **一定在伺服器端驗證**：token 交給 `siteverify` 驗證，並比對回傳的 `hostname`，別的網站產生的 token 不能用。
 - **cookie 防偽造**：`<到期時間>.<HMAC-SHA256>`，以 `GATE_KEY` 簽章、constant-time 比對。
 - **cookie 屬性**：`HttpOnly`、`Secure`、`SameSite=Lax`；不轉送給後端。
-- **防 open redirect**：`next` 只接受站內相對路徑，`//evil.com` 等一律改成 `/`。
+- **防 open redirect**：`next` 只接受站內相對路徑。含控制字元（TAB、換行等）的一律拒絕；先照 `http.Redirect` 的方式整理路徑（`/./\evil.com` → `/\evil.com`）再檢查一次，`//`、`/\` 開頭的都改成 `/`。
+- **只認自己的網域**：設 `ALLOWED_HOSTS` 後，`Host` 不在清單內的請求（直接打 IP 的掃描器）回 `404`，看不到驗證頁，也碰不到後端。
+- **免驗證路徑**：`BYPASS_PREFIXES` 只在解碼後的路徑沒有 `..` 片段時放行，`/webdav/%2e%2e/webapi/...` 這類編碼過的跳脫會被要求驗證。
+- **後端憑證**：設 `UPSTREAM_SERVER_NAME` 時以該網域驗證後端憑證，內網有人冒充後端 IP 時連線會失敗（502），不會把帳密送給對方。`UPSTREAM_INSECURE=1` 完全不驗證，只在後端是自簽憑證、且接受這個風險時使用。
 - **IP 來源**：預設使用 TCP 連線位址。`CF-Connecting-IP` 只在 `TRUST_CF_HEADER=1` 時採用，避免直接對外時被偽造。
 - **最小映像**：`scratch` 底，只有執行檔與 CA 憑證，以非 root（UID 65534）執行。
 
@@ -74,3 +77,11 @@ DS File、Synology Photos 等 App 無法處理驗證頁。選項：
 ### `GATE_KEY` 外洩或想讓所有人重新驗證？
 
 換一個新的 `GATE_KEY` 重啟即可，所有既有 cookie 立即失效。
+
+`GATE_KEY` 必須是只有你知道的隨機值，不要沿用範例或文件裡的字串。MikroTik 設定檔的 `gateKey` 留空時會自動產生；要更換時：
+
+```
+/container/stop [find comment="gate"]
+/container/envs/set [find list="gate" key="GATE_KEY"] value=[:rndstr length=64 from="0123456789abcdef"]
+/container/start [find comment="gate"]
+```

@@ -45,6 +45,8 @@ var (
 	insecure = os.Getenv("UPSTREAM_INSECURE") == "1"
 	// 以 IP 連上游、但憑證是網域的（例如 DSM 的 Let's Encrypt）時，設成該網域來驗證憑證；設定後忽略 UPSTREAM_INSECURE
 	serverName = os.Getenv("UPSTREAM_SERVER_NAME")
+	// 允許的網域，逗號分隔；設定後其他 Host（例如直接打 IP 的掃描器）一律 404
+	allowedHosts = splitList(os.Getenv("ALLOWED_HOSTS"))
 )
 
 func main() {
@@ -85,8 +87,14 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:              listen,
-		Handler:           mux,
+		Addr: listen,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !allowedHost(r.Host) {
+				http.NotFound(w, r)
+				return
+			}
+			mux.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
@@ -337,6 +345,20 @@ func hasPrefix(p string, list []string) bool {
 func hasDotDot(p string) bool {
 	for _, s := range strings.FieldsFunc(p, func(c rune) bool { return c == '/' || c == '\\' }) {
 		if s == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// 沒設 ALLOWED_HOSTS 時不檢查；比對時去掉 port、不分大小寫
+func allowedHost(h string) bool {
+	if len(allowedHosts) == 0 {
+		return true
+	}
+	h = stripPort(h)
+	for _, a := range allowedHosts {
+		if strings.EqualFold(h, a) {
 			return true
 		}
 	}

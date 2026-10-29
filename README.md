@@ -16,7 +16,7 @@
 - **不必經過 Cloudflare**：Turnstile 只負責判斷「是不是人」，你的流量不經過 Cloudflare
 - **可跑在路由器上**：提供 `amd64`、`arm64`、`arm/v7` 映像，附 MikroTik RouterOS v7 container 部署範例
 - **HTTPS 自帶**：讀取匯入的 PEM 憑證，檔案更新後自動重新載入，不必重啟
-- **安全預設**：伺服器端 `siteverify` 驗證、HMAC 簽章 cookie、驗證 token 網域、防 open redirect、不轉送閘門 cookie 給後端
+- **安全預設**：伺服器端 `siteverify` 驗證、HMAC 簽章 cookie、驗證 token 網域、防 open redirect、不轉送閘門 cookie 給後端，可用網域驗證後端憑證
 
 ## 運作原理
 
@@ -55,11 +55,14 @@ docker run -d --name turnstile-gate -p 8443:8443 \
   -e TURNSTILE_SECRET=0x4AAAA... \
   -e GATE_KEY="$(openssl rand -hex 32)" \
   -e UPSTREAM=https://192.168.1.10:5001 \
-  -e UPSTREAM_INSECURE=1 \
+  -e UPSTREAM_SERVER_NAME=你的網域 \
+  -e ALLOWED_HOSTS=你的網域 \
   -e CERT_FILE=/cert/fullchain.pem \
   -e KEY_FILE=/cert/privkey.pem \
-  ghcr.io/OWNER/turnstile-gate:latest
+  ghcr.io/sinnoken/turnstile-gate:latest
 ```
+
+`UPSTREAM_SERVER_NAME` 讓閘門用 IP 連後端、但以網域驗證後端憑證（例如 DSM 已套用該網域的 Let's Encrypt 憑證）。後端只有自簽憑證時，改用 `UPSTREAM_INSECURE=1`（不驗證，內網被冒充時無法察覺）。
 
 ### 3. 對外
 
@@ -79,11 +82,13 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 | `UPSTREAM` | ✅ | | 後端位址，例：`https://192.168.1.10:5001` |
 | `UPSTREAM_INSECURE` | | 關 | `1` = 不驗證後端憑證（後端為自簽憑證時） |
 | `UPSTREAM_SERVER_NAME` | | | 以這個網域名稱驗證後端憑證（`UPSTREAM` 用 IP、後端憑證是網域憑證時，例：DSM 的 Let's Encrypt 憑證）。設定後忽略 `UPSTREAM_INSECURE` |
+| `ALLOWED_HOSTS` | | 不檢查 | 允許的網域，逗號分隔，不分大小寫、忽略 port。其他 `Host`（例如直接打 IP 的掃描器）一律回 `404`。**建議設定** |
 | `LISTEN` | | `:8443` | 監聽位址 |
 | `CERT_FILE` / `KEY_FILE` | | | PEM 憑證與私鑰。兩者都設才啟用 HTTPS，否則以 HTTP 監聽 |
 | `SESSION_HOURS` | | `12` | 通過驗證後 cookie 有效時數 |
-| `BYPASS_PREFIXES` | | | 免驗證的路徑前綴，逗號分隔，例：`/webdav/` |
+| `BYPASS_PREFIXES` | | | 免驗證的路徑前綴，逗號分隔，例：`/webdav/`（建議以 `/` 結尾）。解碼後含 `..` 片段的路徑（例：`/webdav/%2e%2e/...`）不放行 |
 | `TRUST_CF_HEADER` | | 關 | `1` = 信任 `CF-Connecting-IP`。**只在 Cloudflare 代理或 Tunnel 後方開啟**，直接對外時此標頭可被偽造 |
+| `GOMEMLIMIT` | | | Go runtime 的記憶體軟上限，記憶體有限的設備（路由器）建議 `48MiB` |
 
 ### 端點
 
@@ -114,7 +119,7 @@ docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t turnstile
 docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-arm64.tar .
 ```
 
-GitHub Actions 會在推送到 `main` 時發布 `ghcr.io/OWNER/turnstile-gate:latest`；推送 `v*` tag 時另外建立 Release，附上 `arm64`、`armv7`、`amd64` 三種 RouterOS 可直接匯入的 tar 與 SHA-256。
+GitHub Actions 會在推送到 `main` 時發布 `ghcr.io/sinnoken/turnstile-gate:latest`；推送 `v*` tag 時另外建立 Release，附上 `arm64`、`armv7`、`amd64` 三種 RouterOS 可直接匯入的 tar 與 SHA-256。
 
 ## 限制
 

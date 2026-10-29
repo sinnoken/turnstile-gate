@@ -54,6 +54,8 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 :local gateKey ""
 ```
 
+`domain` 是使用者連線用的網域，同時用在 `UPSTREAM_SERVER_NAME`（驗證 DSM 憑證）與 `ALLOWED_HOSTS`（其他 Host 一律 404）。設好後，用 IP 或其他網域連閘門都會得到 404。
+
 `gateKey` 是簽 cookie 用的 `GATE_KEY`。留空時，匯入會用 `:rndstr` 自動產生 64 字元的隨機 hex 金鑰，存在容器環境變數（`/container/envs/print where key=GATE_KEY`）。要自訂就填 `openssl rand -hex 32` 的結果，會照原樣使用。
 留空時每次重新匯入都會產生新金鑰，所有人需要重新驗證一次；想保留原本的金鑰，重新匯入前把它填回 `gateKey`。
 
@@ -138,6 +140,26 @@ chain=forward dst-address=172.17.0.2 dst-port=8443 connection-state=new action=d
 
 NAT 規則只比對 `in-interface-list=WAN`，在家裡用網域連線不會被轉發。家裡請直接用 NAS 內網 IP，或自行加 hairpin NAT。
 
+## 更新映像
+
+`remote-image` 只在建立容器時拉一次，之後不會自動更新。`main` 有新版的 `:latest` 時：
+
+```
+/container/stop [find comment="gate"]
+/container/repull [find comment="gate"]
+/container/print                      # 等 status 回到 stopped（下載與解壓完成）
+/container/start [find comment="gate"]
+```
+
+envs、掛載、網路與開機自動啟動都會保留，只換映像。新版需要新的 env 時，在 `stop` 之後、`start` 之前調整 `/container/envs`，例如用舊版設定檔部署的路由器要補上：
+
+```
+/container/envs/remove [find list="gate" key="UPSTREAM_INSECURE"]
+/container/envs/add list=gate key=UPSTREAM_SERVER_NAME value="你的網域"
+/container/envs/add list=gate key=ALLOWED_HOSTS        value="你的網域"
+/container/envs/add list=gate key=GOMEMLIMIT           value="48MiB"
+```
+
 ## 疑難排解
 
 | 症狀 | 可能原因 |
@@ -149,6 +171,7 @@ NAT 規則只比對 `in-interface-list=WAN`，在家裡用網域連線不會被�
 | log 有 `permission denied` | 映像以 UID 65534 執行，掛載檔案權限不足。可在 Dockerfile 移除 `USER 65534` 重新打包 |
 | 驗證頁出現但一直失敗，log 有 `siteverify error` | 容器連不到外網：檢查 masquerade 是否涵蓋 `172.17.0.0/24`、DNS 是否可用（`/ip/dns` 的 `allow-remote-requests=yes`） |
 | Turnstile 元件顯示錯誤 | Turnstile 後台沒加入此網域 |
+| 連線得到 `404 page not found` | 用了 `ALLOWED_HOSTS` 以外的 Host（例如直接打 IP）。改用網域連線，或確認 `domain` 沒打錯 |
 | 502 Bad Gateway | `UPSTREAM` 位址錯誤，或 forward 規則沒放行容器到 NAS:5001 |
 | 502 Bad Gateway，log 有 `x509` 或 `failed to verify certificate` | DSM 5001 用的不是 `domain` 的有效憑證（自簽、其他網域或已過期），或 `domain` 打錯；路由器時間不正確也會讓憑證驗證失敗，用 `/system/clock/print` 確認並啟用 `/system/ntp/client` |
 

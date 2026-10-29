@@ -2,6 +2,17 @@
 
 接下來開發的依據。讀完就能開工。
 
+## 0. 進度（2026-10-29）
+
+| 狀態 | 項目 |
+|:-:|---|
+| ✅ | F6／§3.6 `UPSTREAM_SERVER_NAME`（`a79bdd2`）；`.rsc` 加 `domain`、刪 `UPSTREAM_INSECURE`；compose 改用 `UPSTREAM_SERVER_NAME` |
+| ✅ | §3.8／compose 加 `ALLOWED_HOSTS`、`GOMEMLIMIT`；`go.mod` 改 `go 1.25` |
+| ⚠️ | `ALLOWED_HOSTS` 的 Host 檢查已實作（不符回 `404`，`allowedHost()`），但還沒有 `bad_host` 事件與封鎖，等封鎖機制接上 |
+| ❌ | 封鎖機制 F1～F5、slog、body 上限、HSTS、`config`、`gate_test.go`、CI 排程與 `go test`／`govulncheck`、`docs/blocking.md`、`CHANGES-blocking.md`、U6 |
+
+本文件以外已完成（安全掃描與部署修正）：`safeNext` 先整理路徑再檢查（open redirect）、`BYPASS_PREFIXES` 不放行含 `..` 的路徑、SIGTERM 正常關機、`.rsc` 的 `gateKey` 留空自動產生、RouterOS 7.24+ 語法、從 GHCR 拉映像與 `repull` 更新。
+
 ---
 
 ## 1. 背景與限制
@@ -13,7 +24,7 @@
 ```
 
 - 家用環境，容器跑在 RB5009（arm64）上，記憶體與儲存都有限。
-- DSM 網域使用 Synology DDNS，前綴 `dsm512.`，**完整後綴待確認（D2）**。
+- DSM 網域使用 Synology DDNS：`ninja218j.myds.me`（D2 已確定）。
 - **閘門直接對外**，不經過 Cloudflare 代理或 Tunnel。只有 Turnstile 會用到 Cloudflare。
 - 憑證來自 DSM 的 Let's Encrypt，由 DSM 排程推送到路由器。
 - 使用者偏好：**輕量、精簡、有效**；不為理論風險增加複雜度；重視實際數據。
@@ -44,7 +55,7 @@
 | F3 | 累犯加重：7 天內第 1 次封 1 小時、第 2 次封 24 小時、第 3 次以上封 7 天 |
 | F4 | 換 `GATE_KEY` 後，舊 cookie 只會讓使用者重新驗證一次，不會被封鎖 |
 | F5 | 私有、loopback、link-local IP 永不封鎖 |
-| F6 | 上游可以用內網 IP 連線，同時用網域名稱驗證 DSM 憑證 |
+| F6 | 上游可以用內網 IP 連線，同時用網域名稱驗證 DSM 憑證（✅ 已完成） |
 
 ### 2.2 非功能需求
 
@@ -188,10 +199,10 @@ func (l blockListener) Accept() (net.Conn, error) {
 | 項目 | 設計 |
 |---|---|
 | 日誌 | 改用 `log/slog` 的 JSON handler 輸出到 stdout。`LOG_LEVEL` 預設 `info`：只記錄事件、封鎖、錯誤、啟動與憑證載入。`debug` 才記錄每筆請求與 listener 丟棄的連線 |
-| `UPSTREAM_SERVER_NAME` | 設定後 `tls.Config{ServerName: 該值}`，以網域名稱驗證 DSM 憑證，忽略 `UPSTREAM_INSECURE`。兩者都設時在啟動日誌提示 |
+| `UPSTREAM_SERVER_NAME` | ✅ 已完成。設定後 `tls.Config{ServerName: 該值}`，以網域名稱驗證 DSM 憑證，忽略 `UPSTREAM_INSECURE`。兩者都設時在啟動日誌提示 |
 | body 上限 | `verify()` 開頭 `r.Body = http.MaxBytesReader(w, r.Body, 4<<10)`；`ParseForm` 失敗回 `413`。Turnstile token 最長約 2 KB，4 KB 足夠 |
 | HSTS | 只在 HTTPS 模式加上 `Strict-Transport-Security: max-age=31536000`。轉發的回應在 `ModifyResponse` 先刪掉 DSM 自己的 HSTS，避免重複標頭 |
-| Go 版本 | `go.mod` 改成 `go 1.24`，與 Dockerfile 的 `golang:1.24-alpine` 一致 |
+| Go 版本 | `go.mod` 改成 `go 1.25`，與 Dockerfile 的 `golang:1.25-alpine` 一致（Dockerfile 已由 dependabot 升到 1.25；之後 dependabot 升 Dockerfile 時一併更新 `go.mod`） |
 | 設定 | 新增 `type config struct` 與 `loadConfig() (*config, error)`，在 `main()` 呼叫。package `var` 不再讀環境變數。handler 與 `blocker` 以 `*gate` 結構持有設定，測試直接建構 |
 | CI | `build.yml` 加 `schedule: - cron: "0 3 * * 1"`（每週一重建，拿到新的 base image 與 CA）；test job 加 `go test -race ./...` 與 `govulncheck ./...`。排程觸發時 `image` job 照常推送 `latest` |
 
@@ -203,39 +214,31 @@ func (l blockListener) Accept() (net.Conn, error) {
 |---|---|
 | `main.go` | 加入 `config`／`loadConfig`、`blocker`、`blockListener`、`cookieState`、Host 檢查、slog、上游憑證驗證、body 上限、HSTS |
 | `gate_test.go` | **新增**。測試檔不需要進映像，`Dockerfile` 與 `.dockerignore` **不用改** |
-| `go.mod` | `go 1.24` |
+| `go.mod` | ✅ `go 1.25` |
 | `.github/workflows/build.yml` | 每週排程、`go test -race`、`govulncheck` |
 | `deploy/mikrotik-gate.rsc` | 見 §3.8 |
-| `deploy/docker-compose.yml` | 新增 `ALLOWED_HOSTS`、`UPSTREAM_SERVER_NAME`、`GOMEMLIMIT`；`UPSTREAM_INSECURE` 改為註解 |
+| `deploy/docker-compose.yml` | ✅ 已完成 |
 | `README.md` | 特色加「自動封鎖」；環境變數表；新增「封鎖機制」小節；建置段落加測試指令 |
 | `docs/blocking.md` | **新增**。事件、封鎖時長、防誤封、日誌格式、如何查詢與解除（重啟容器） |
-| `docs/deploy-mikrotik.md` | 變數範例加 `domain`；envs 說明；U2～U5 的建議設定 |
+| `docs/deploy-mikrotik.md` | envs 說明；U2～U4 的建議設定（`domain` 變數範例、U5 NTP 已完成） |
 | `docs/security.md` | 「擋什麼、不擋什麼」加入封鎖機制；FAQ「`GATE_KEY` 外洩」補充：換金鑰只會讓所有人重新驗證，不會被封鎖 |
 | `docs/cert-sync-dsm.md` | §5 排程補上「僅在異常終止時寄信」（U6）與萬用字元憑證說明（U1） |
 | `CHANGES-blocking.md` | **新增**。本次異動說明 |
 
 ### 3.8 RouterOS（`.rsc`）
 
-只改變數與第 6 段：
+✅ 已完成：`domain` 變數、`UPSTREAM_SERVER_NAME`、`ALLOWED_HOSTS`、`GOMEMLIMIT`，並刪除 `UPSTREAM_INSECURE`（RouterOS 7.24+ 語法 `list=`）。
 
-```
-:local domain  "dsm512.EXAMPLE.me"   ;# DSM 的網域（D2）
-...
-/container/envs/add name=gate key=ALLOWED_HOSTS        value=$domain
-/container/envs/add name=gate key=UPSTREAM_SERVER_NAME value=$domain
-/container/envs/add name=gate key=GOMEMLIMIT           value="48MiB"
-```
-
-刪除 `UPSTREAM_INSECURE` 那行（改由 `UPSTREAM_SERVER_NAME` 驗證憑證）。
+已部署的路由器不重新匯入，改為 `stop` → 調整 envs → `repull` → `start`（指令見 `docs/deploy-mikrotik.md`「更新映像」）。
 
 ### 3.9 新的環境變數
 
 | 變數 | 預設 | 說明 |
 |---|---|---|
-| `ALLOWED_HOSTS` | 不檢查 | 允許的網域，逗號分隔，不分大小寫，去掉 port。**強烈建議設定**，否則 `bad_host` 不會生效 |
-| `UPSTREAM_SERVER_NAME` | 無 | 驗證上游憑證時使用的網域名稱。設定後忽略 `UPSTREAM_INSECURE` |
+| `ALLOWED_HOSTS` | 不檢查 | ✅ Host 檢查已完成（不符回 404）。允許的網域，逗號分隔，不分大小寫，去掉 port。**強烈建議設定**，否則 `bad_host` 不會生效 |
+| `UPSTREAM_SERVER_NAME` | 無 | ✅ 已完成。驗證上游憑證時使用的網域名稱。設定後忽略 `UPSTREAM_INSECURE` |
 | `LOG_LEVEL` | `info` | `debug` 時逐筆記錄請求 |
-| `GOMEMLIMIT` | 無 | Go runtime 內建，建議 `48MiB` |
+| `GOMEMLIMIT` | 無 | ✅ 已寫進 `.rsc`、compose。Go runtime 內建，建議 `48MiB` |
 
 ### 3.10 日誌格式
 
@@ -279,8 +282,8 @@ func (l blockListener) Accept() (net.Conn, error) {
 | 3 | `cookieState` | 更換 `GATE_KEY` 後帶舊 cookie：瀏覽器被導向驗證頁且 cookie 被清除，IP 未被封鎖 |
 | 4 | `blocker`、`ALLOWED_HOSTS`、三種事件 | 錯誤 Host 1 次即封鎖；`verify_fail` 第 1 次不封、10 分鐘內第 2 次封鎖；私有 IP 永不封鎖；favicon 與無 cookie 的 API 請求不產生事件 |
 | 5 | `blockListener`、累犯加重 | 被封鎖的 IP 連線 TLS 握手失敗（`curl` 顯示連線被重設）；7 天內第 2 次封鎖 24 小時、第 3 次 7 天；`TRUST_CF_HEADER=1` 時不包 listener，改回 403 |
-| 6 | 上游憑證驗證、body 上限、HSTS | 設 `UPSTREAM_SERVER_NAME` 後可驗證上游憑證；5 KB body 回 413；HTTPS 回應只有一個 HSTS 標頭 |
-| 7 | `gate_test.go` | 涵蓋 `safeNext`、`cookieState` 五種狀態、事件與封鎖時長（以可注入的 `now` 測試）、私有 IP、Host 檢查、`blockListener`、body 上限 |
+| 6 | body 上限、HSTS（上游憑證驗證已完成） | 5 KB body 回 413；HTTPS 回應只有一個 HSTS 標頭 |
+| 7 | `gate_test.go` | 涵蓋 `safeNext`（含 `/./\evil.com`、TAB 等繞過案例）、`hasDotDot`、`cookieState` 五種狀態、事件與封鎖時長（以可注入的 `now` 測試）、私有 IP、Host 檢查、`blockListener`、body 上限 |
 | 8 | CI | YAML 語法正確；`govulncheck` 在本機可跑 |
 | 9 | `.rsc`、compose、文件 | 文件中的環境變數與程式一致；`grep -r UPSTREAM_INSECURE` 只剩說明「可選」的地方 |
 | 10 | `CHANGES-blocking.md` | 包含摘要、行為變更、環境變數、檔案異動、升級注意事項、驗證狀態 |
@@ -304,8 +307,8 @@ CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o gate-arm64 .
 | # | 問題 | 預設處理 |
 |---|---|---|
 | D1 | 封鎖在閘門內（A）還是通知路由器（B）？ | 本文件採用 **A**。若改 B，見 §3.1 的備註 |
-| D2 | DSM 網域完整後綴（`dsm512.???`） | `.rsc` 與 compose 先用 `dsm512.EXAMPLE.me` 佔位 |
-| — | 所有 `OWNER` 佔位符要換成哪個 GitHub 帳號？ | 保留 `OWNER` |
+| D2 | DSM 網域 | ✅ 已確定：`ninja218j.myds.me`。`.rsc` 與 compose 是給他人用的範本，維持 `nas.example.com`／`你的網域` 佔位 |
+| — | 所有 `OWNER` 佔位符要換成哪個 GitHub 帳號？ | ✅ 已確定：`sinnoken`（映像 `ghcr.io/sinnoken/turnstile-gate`）。`LICENSE` 著作權人另行決定 |
 
 ### 7.2 使用者自行設定（會寫進文件）
 

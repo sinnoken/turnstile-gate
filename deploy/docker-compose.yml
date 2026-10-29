@@ -2,7 +2,7 @@
 # MikroTik RouterOS 請改看 docs/deploy-mikrotik.md
 services:
   gate:
-    image: ghcr.io/OWNER/turnstile-gate:latest   # 或改成 build: ..
+    image: ghcr.io/sinnoken/turnstile-gate:latest   # 或改成 build: ..
     restart: unless-stopped
     ports:
       - "8443:8443"          # 路由器：WAN 443 → 這台 8443
@@ -11,9 +11,12 @@ services:
     environment:
       TURNSTILE_SITEKEY: "0x4AAAA..."
       TURNSTILE_SECRET: "0x4AAAA..."
-      GATE_KEY: "openssl rand -hex 32 產生的字串"
+      GATE_KEY: ""             # 必填：貼上 openssl rand -hex 32 的結果，不要沿用範例字串
       UPSTREAM: "https://192.168.1.10:5001"
-      UPSTREAM_INSECURE: "1"   # 上游為自簽憑證時
+      UPSTREAM_SERVER_NAME: "你的網域"   # 以網域驗證後端憑證（DSM 已套用該網域憑證時）
+      # UPSTREAM_INSECURE: "1"  # 後端只有自簽憑證時才改用這行（不驗證憑證）
+      ALLOWED_HOSTS: "你的網域"   # 其他 Host（直接打 IP 的掃描器）回 404
+      GOMEMLIMIT: "48MiB"
       CERT_FILE: "/cert/fullchain.pem"
       KEY_FILE: "/cert/privkey.pem"
       SESSION_HOURS: "12"
