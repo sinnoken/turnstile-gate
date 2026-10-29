@@ -1,0 +1,16 @@
+# workflow 的 action 與 Dockerfile 的基底映像有新版時自動開 PR
+# 本專案沒有 Go 外部依賴（無 go.sum），所以不追蹤 gomod
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
