@@ -46,12 +46,16 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 
 ```
 :local nasIP   "192.168.88.10"
+:local domain  "nas.example.com"
 :local disk    "usb1"
 :local image   "ghcr.io/sinnoken/turnstile-gate:latest"
 :local siteKey "0x4AAAA..."
 :local secret  "0x4AAAA..."
-:local gateKey "<openssl rand -hex 32>"
+:local gateKey ""
 ```
+
+`gateKey` 是簽 cookie 用的 `GATE_KEY`。留空時，匯入會用 `:rndstr` 自動產生 64 字元的隨機 hex 金鑰，存在容器環境變數（`/container/envs/print where key=GATE_KEY`）。要自訂就填 `openssl rand -hex 32` 的結果，會照原樣使用。
+留空時每次重新匯入都會產生新金鑰，所有人需要重新驗證一次；想保留原本的金鑰，重新匯入前把它填回 `gateKey`。
 
 上傳後匯入：
 
@@ -112,6 +116,8 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 
 - **控制台 → 安全性 → 受信任的 Proxy**（依 DSM 版本名稱可能不同）加入 `172.17.0.2`，讓 DSM 讀 `X-Real-IP`。
   否則 DSM 眼中所有連線都來自閘門，一旦觸發自動封鎖，**所有人都會被擋**。
+- **控制台 → 安全性 → 憑證**：DSM 本身（5001）使用的憑證必須是 `domain` 的有效憑證（例如 Let's Encrypt）。
+  閘門以 `nasIP` 連到 DSM，但以 `domain`（`UPSTREAM_SERVER_NAME`）驗證憑證；自簽或其他網域的憑證會讓所有請求都 502。
 - 關閉 QuickConnect、路由器與 DSM 的 UPnP，確認 5000/5001 沒有對外。
 
 ## 速率限制
@@ -144,6 +150,7 @@ NAT 規則只比對 `in-interface-list=WAN`，在家裡用網域連線不會被�
 | 驗證頁出現但一直失敗，log 有 `siteverify error` | 容器連不到外網：檢查 masquerade 是否涵蓋 `172.17.0.0/24`、DNS 是否可用（`/ip/dns` 的 `allow-remote-requests=yes`） |
 | Turnstile 元件顯示錯誤 | Turnstile 後台沒加入此網域 |
 | 502 Bad Gateway | `UPSTREAM` 位址錯誤，或 forward 規則沒放行容器到 NAS:5001 |
+| 502 Bad Gateway，log 有 `x509` 或 `failed to verify certificate` | DSM 5001 用的不是 `domain` 的有效憑證（自簽、其他網域或已過期），或 `domain` 打錯；路由器時間不正確也會讓憑證驗證失敗，用 `/system/clock/print` 確認並啟用 `/system/ntp/client` |
 
 ## 移除
 

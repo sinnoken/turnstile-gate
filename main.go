@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,9 +43,14 @@ var (
 	bypass = splitList(os.Getenv("BYPASS_PREFIXES"))
 	// 上游是自簽憑證（DSM 預設）時設 1
 	insecure = os.Getenv("UPSTREAM_INSECURE") == "1"
+	// 以 IP 連上游、但憑證是網域的（例如 DSM 的 Let's Encrypt）時，設成該網域來驗證憑證；設定後忽略 UPSTREAM_INSECURE
+	serverName = os.Getenv("UPSTREAM_SERVER_NAME")
 )
 
 func main() {
+	if insecure && serverName != "" {
+		log.Printf("UPSTREAM_SERVER_NAME=%s 已設定，忽略 UPSTREAM_INSECURE", serverName)
+	}
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(upstream)
@@ -57,7 +63,7 @@ func main() {
 			stripGateCookie(r.Out)
 		},
 		Transport: &http.Transport{
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure},
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure && serverName == "", ServerName: serverName},
 			MaxIdleConnsPerHost: 32,
 		},
 	}
@@ -66,7 +72,7 @@ func main() {
 	mux.HandleFunc("GET /__gate", servePage)
 	mux.HandleFunc("POST /__gate/verify", verify)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if validCookie(r) || hasPrefix(r.URL.Path, bypass) {
+		if validCookie(r) || (hasPrefix(r.URL.Path, bypass) && !hasDotDot(r.URL.Path)) {
 			proxy.ServeHTTP(w, r)
 			return
 		}
@@ -294,17 +300,43 @@ func clientIP(r *http.Request) string {
 	return strings.Trim(h, "[]")
 }
 
-// 只允許站內相對路徑，防止 open redirect
+// 只允許站內相對路徑，防止 open redirect。
+// http.Redirect 會再做 path.Clean（/./\x → /\x），所以先照同樣方式整理、再檢查一次並回傳整理後的值；
+// 瀏覽器會忽略網址裡的 TAB、換行（/<TAB>/x 等於 //x），含控制字元一律拒絕
 func safeNext(n string) string {
-	if !strings.HasPrefix(n, "/") || strings.HasPrefix(n, "//") || strings.HasPrefix(n, "/\\") {
+	bad := func(s string) bool {
+		return !strings.HasPrefix(s, "/") || strings.HasPrefix(s, "//") || strings.HasPrefix(s, "/\\")
+	}
+	if bad(n) || strings.ContainsFunc(n, func(r rune) bool { return r < ' ' || r == 0x7f }) {
 		return "/"
 	}
-	return n
+	p, q := n, ""
+	if i := strings.Index(n, "?"); i >= 0 {
+		p, q = n[:i], n[i:]
+	}
+	c := path.Clean(p)
+	if strings.HasSuffix(p, "/") && !strings.HasSuffix(c, "/") {
+		c += "/"
+	}
+	if bad(c) {
+		return "/"
+	}
+	return c + q
 }
 
 func hasPrefix(p string, list []string) bool {
 	for _, x := range list {
 		if strings.HasPrefix(p, x) {
+			return true
+		}
+	}
+	return false
+}
+
+// ServeMux 不會清理 %2e%2e、..%2f 這類編碼過的 ..，原樣轉給上游後可能被正規化成前綴以外的路徑
+func hasDotDot(p string) bool {
+	for _, s := range strings.FieldsFunc(p, func(c rune) bool { return c == '/' || c == '\\' }) {
+		if s == ".." {
 			return true
 		}
 	}

@@ -78,6 +78,7 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 | `GATE_KEY` | ✅ | | 簽 cookie 用的密鑰，建議 `openssl rand -hex 32` |
 | `UPSTREAM` | ✅ | | 後端位址，例：`https://192.168.1.10:5001` |
 | `UPSTREAM_INSECURE` | | 關 | `1` = 不驗證後端憑證（後端為自簽憑證時） |
+| `UPSTREAM_SERVER_NAME` | | | 以這個網域名稱驗證後端憑證（`UPSTREAM` 用 IP、後端憑證是網域憑證時，例：DSM 的 Let's Encrypt 憑證）。設定後忽略 `UPSTREAM_INSECURE` |
 | `LISTEN` | | `:8443` | 監聽位址 |
 | `CERT_FILE` / `KEY_FILE` | | | PEM 憑證與私鑰。兩者都設才啟用 HTTPS，否則以 HTTP 監聽 |
 | `SESSION_HOURS` | | `12` | 通過驗證後 cookie 有效時數 |

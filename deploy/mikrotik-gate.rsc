@@ -4,11 +4,18 @@
 # 所有新增項目都有 comment 含 "gate"，方便日後查找/移除
 {
 :local nasIP   "192.168.88.10"      ;# NAS 的內網 IP
+:local domain  "nas.example.com"    ;# 你的網域；DSM 5001 的憑證必須是這個網域的
 :local disk    "usb1"               ;# /disk print 看外接碟名稱
 :local image   "ghcr.io/sinnoken/turnstile-gate:latest"   ;# 路由器直接從 GHCR 拉映像
 :local siteKey "0x4AAAA_SITEKEY"
 :local secret  "0x4AAAA_SECRET"
-:local gateKey "REPLACE_WITH_openssl_rand_hex_32"
+:local gateKey ""                   ;# 留空＝匯入時自動產生；要自訂請填 openssl rand -hex 32 的結果
+
+# cookie 簽章金鑰：留空（或仍是舊範本的佔位字串）就用 :rndstr 產生 64 字元 hex，絕不使用公開的固定值
+:if (($gateKey = "") || ($gateKey = "REPLACE_WITH_openssl_rand_hex_32")) do={
+    :set gateKey [:rndstr length=64 from="0123456789abcdef"]
+    :put "已自動產生 GATE_KEY（會存入 /container/envs list=gate）"
+}
 
 # ---------- 1. 容器網路 ----------
 /interface/bridge/add name=br-ct comment="gate"
@@ -63,7 +70,7 @@
 /container/envs/add list=gate key=TURNSTILE_SECRET  value=$secret
 /container/envs/add list=gate key=GATE_KEY          value=$gateKey
 /container/envs/add list=gate key=UPSTREAM          value="https://$nasIP:5001"
-/container/envs/add list=gate key=UPSTREAM_INSECURE value="1"
+/container/envs/add list=gate key=UPSTREAM_SERVER_NAME value=$domain
 /container/envs/add list=gate key=CERT_FILE         value="/cert/fullchain.pem"
 /container/envs/add list=gate key=KEY_FILE          value="/cert/privkey.pem"
 /container/envs/add list=gate key=SESSION_HOURS     value="12"
