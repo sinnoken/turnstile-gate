@@ -7,8 +7,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/tls"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"log"
@@ -27,28 +29,63 @@ import (
 
 const cookieName = "__gate"
 
+// 設定值由 loadConfig 從環境變數讀入（測試時直接指定）
 var (
-	siteKey   = mustEnv("TURNSTILE_SITEKEY")
-	secretKey = mustEnv("TURNSTILE_SECRET")
-	gateKey   = []byte(mustEnv("GATE_KEY")) // 隨機長字串，用來簽 cookie
-	upstream  = mustURL(mustEnv("UPSTREAM")) // 例：https://192.168.1.10:5001
-	listen    = envOr("LISTEN", ":8443")
+	siteKey   string
+	secretKey string
+	gateKey   []byte   // 隨機長字串，用來簽 cookie
+	upstream  *url.URL // 例：https://192.168.1.10:5001
+	listen    string
 	// 匯入的憑證（PEM）。兩個都有就啟用 HTTPS；檔案更新後會自動重新載入
-	certFile, keyFile = certPaths()
+	certFile, keyFile string
 	// 只有在 Cloudflare 後面時才設 1；直接對外時這個標頭可被偽造
-	trustCF = os.Getenv("TRUST_CF_HEADER") == "1"
-	ttl       = time.Duration(envInt("SESSION_HOURS", 12)) * time.Hour
+	trustCF bool
+	ttl     time.Duration
 	// 不需驗證的路徑前綴（給手機 App 等），逗號分隔；預設全部都要驗證
-	bypass = splitList(os.Getenv("BYPASS_PREFIXES"))
+	bypass []string
 	// 上游是自簽憑證（DSM 預設）時設 1
-	insecure = os.Getenv("UPSTREAM_INSECURE") == "1"
+	insecure bool
 	// 以 IP 連上游、但憑證是網域的（例如 DSM 的 Let's Encrypt）時，設成該網域來驗證憑證；設定後忽略 UPSTREAM_INSECURE
-	serverName = os.Getenv("UPSTREAM_SERVER_NAME")
+	serverName string
 	// 允許的網域，逗號分隔；設定後其他 Host（例如直接打 IP 的掃描器）一律 404
-	allowedHosts = splitList(os.Getenv("ALLOWED_HOSTS"))
+	allowedHosts []string
 )
 
+func loadConfig() error {
+	var err error
+	if siteKey, err = needEnv("TURNSTILE_SITEKEY"); err != nil {
+		return err
+	}
+	if secretKey, err = needEnv("TURNSTILE_SECRET"); err != nil {
+		return err
+	}
+	gk, err := needEnv("GATE_KEY")
+	if err != nil {
+		return err
+	}
+	gateKey = []byte(gk)
+	up, err := needEnv("UPSTREAM")
+	if err != nil {
+		return err
+	}
+	if upstream, err = parseUpstream(up); err != nil {
+		return err
+	}
+	listen = envOr("LISTEN", ":8443")
+	certFile, keyFile = certPaths()
+	trustCF = os.Getenv("TRUST_CF_HEADER") == "1"
+	ttl = time.Duration(envInt("SESSION_HOURS", 12)) * time.Hour
+	bypass = splitList(os.Getenv("BYPASS_PREFIXES"))
+	insecure = os.Getenv("UPSTREAM_INSECURE") == "1"
+	serverName = os.Getenv("UPSTREAM_SERVER_NAME")
+	allowedHosts = splitList(os.Getenv("ALLOWED_HOSTS"))
+	return nil
+}
+
 func main() {
+	if err := loadConfig(); err != nil {
+		log.Fatal(err)
+	}
 	if insecure && serverName != "" {
 		log.Printf("UPSTREAM_SERVER_NAME=%s 已設定，忽略 UPSTREAM_INSECURE", serverName)
 	}
@@ -71,6 +108,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /__gate", servePage)
+	mux.HandleFunc("GET /__gate/h.woff2", serveFont)
 	mux.HandleFunc("POST /__gate/verify", verify)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if validCookie(r) || (hasPrefix(r.URL.Path, bypass) && !hasDotDot(r.URL.Path)) {
@@ -96,6 +134,7 @@ func main() {
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 	// 停止容器時會收到 SIGTERM。容器內的 PID 1 不會被訊號的預設動作終止，
 	// Go 最後只能以 exit status 2 結束，所以自己處理：等進行中的請求結束後正常退出
@@ -175,21 +214,60 @@ var page = template.Must(template.New("p").Parse(`<!doctype html>
 <html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
-<title>驗證中</title>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+<title>安全確認</title>
 <style>
-body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:system-ui,sans-serif;background:#f4f4f5;color:#18181b}
-@media(prefers-color-scheme:dark){body{background:#18181b;color:#e4e4e7}}
-main{text-align:center;padding:16px}
+@font-face{font-family:"Gate Heading";font-weight:800;font-display:swap;src:url(/__gate/h.woff2) format("woff2")}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;font-family:system-ui,"PingFang TC","Microsoft JhengHei","Noto Sans TC",sans-serif;color:#2d3b2a;background:#e3e0eb radial-gradient(#f2f1f6 22%,transparent 23%);background-size:22px 22px}
+main{width:100%;max-width:440px;display:flex;flex-direction:column;align-items:center;gap:24px;text-align:center}
+p{margin:0}
+.eb{font-size:18px;font-weight:700;letter-spacing:.08em;color:#4a7f69}
+.s{color:#d75351}.s::before{content:"★"}
+h1{margin:0;padding:14px 28px;border:3px solid #382d39;border-radius:20px;box-shadow:5px 5px 0 #382d39;background:#fff;color:#2d3b2a;font:800 36px/1.2 "Gate Heading",system-ui,sans-serif}
+.er{width:100%;padding:12px 24px;background:#444;color:#fff;font-size:15px;font-weight:700}
+section{width:100%;padding:24px;border:6px solid #64af91;background:#fff;display:flex;flex-direction:column;align-items:center;gap:16px}
+#st{font-size:15px;line-height:1.75}
+.fn{font-size:12px;line-height:1.6;color:#3b3b3d}
+@media(prefers-color-scheme:dark){
+body{color:#fff;background:linear-gradient(#7d34b3 1px,transparent 1px),linear-gradient(90deg,#7d34b3 1px,transparent 1px) #6f23a7;background-size:32px 32px}
+.eb{color:#0adaca}.s{color:#f997d2}.s::before{content:"☆"}
+h1{background:#fdbae6;border-color:#340d50;box-shadow:5px 5px 0 #340d50;color:#340d50}
+section{background:#340d50;border-color:#340d50}
+.fn{color:#e0d0f0}
+}
 </style></head><body><main>
-<p>請完成驗證以繼續</p>
+<p class="eb"><span class="s" aria-hidden="true"></span> SECURITY CHECK <span class="s" aria-hidden="true"></span></p>
+<h1>請完成驗證以繼續！</h1>
+{{if .Err}}<p class="er" role="alert">這次沒有確認成功，請再試一次！</p>{{end}}
+<section>
+<noscript><p>請開啟 JavaScript，才能完成驗證。</p></noscript>
 <form id="f" method="post" action="/__gate/verify">
 <input type="hidden" name="next" value="{{.Next}}">
 <div class="cf-turnstile" data-sitekey="{{.SiteKey}}" data-callback="ok"></div>
 </form>
-{{if .Err}}<p style="color:#dc2626">驗證失敗，請再試一次</p>{{end}}
-<script>function ok(){document.getElementById("f").submit()}</script>
-</main></body></html>`))
+<p id="st">驗證元件載入中…</p>
+</section>
+<p class="fn">{{if .Err}}一直失敗的話，請關閉廣告封鎖或換個瀏覽器。{{else}}一段時間內不用再驗證。需要啟用 Cookie 與 JavaScript。{{end}}</p>
+</main>
+<script>
+function say(t){document.getElementById("st").textContent=t}
+function loaded(){say("確認你不是機器人後，就會自動前往網站。")}
+function ok(){say("確認完成！正在前往網站…");document.getElementById("f").submit()}
+</script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=loaded" defer></script>
+</body></html>`))
+
+// 只含標題「請完成驗證以繼續！」這幾個字的子集（Chiron GoRound TC ExtraBold，授權見 fonts/OFL.txt）。
+// 改標題文字就要重新產生，例如用 Google Fonts css2 的 text= 參數或 fonttools 的 pyftsubset
+//
+//go:embed fonts/gate-heading.woff2
+var headingFont []byte
+
+func serveFont(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "font/woff2")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Write(headingFont)
+}
 
 func servePage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
@@ -203,7 +281,15 @@ func servePage(w http.ResponseWriter, r *http.Request) {
 // ---------- 驗證 token、發 cookie ----------
 
 func verify(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
+	// Turnstile token 約 2 KB，表單不需要更大
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	if err := r.ParseForm(); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
 	next := safeNext(r.PostFormValue("next"))
 	token := r.PostFormValue("cf-turnstile-response")
 
@@ -397,12 +483,12 @@ func splitList(s string) []string {
 	return out
 }
 
-func mustEnv(k string) string {
+func needEnv(k string) (string, error) {
 	v := os.Getenv(k)
 	if v == "" {
-		log.Fatalf("missing env %s", k)
+		return "", fmt.Errorf("missing env %s", k)
 	}
-	return v
+	return v, nil
 }
 
 func envOr(k, d string) string {
@@ -419,10 +505,10 @@ func envInt(k string, d int) int {
 	return d
 }
 
-func mustURL(s string) *url.URL {
+func parseUpstream(s string) (*url.URL, error) {
 	u, err := url.Parse(s)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		log.Fatalf("bad UPSTREAM %q", s)
+		return nil, fmt.Errorf("bad UPSTREAM %q", s)
 	}
-	return u
+	return u, nil
 }

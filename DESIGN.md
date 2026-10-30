@@ -2,17 +2,21 @@
 
 接下來開發的依據。讀完就能開工。
 
-## 0. 進度（2026-10-29）
+## 0. 進度（2026-10-30）
 
 | 狀態 | 項目 |
 |:-:|---|
 | ✅ | F6／§3.6 `UPSTREAM_SERVER_NAME`（`a79bdd2`）；`.rsc` 加 `domain`、刪 `UPSTREAM_INSECURE`；compose 改用 `UPSTREAM_SERVER_NAME` |
 | ✅ | §3.8／compose 加 `ALLOWED_HOSTS`；`GOMEMLIMIT=48MiB` 改為 Dockerfile 的 `ENV` 預設；`go.mod` 改 `go 1.25` |
 | ✅ | 預設值：`CERT_FILE`／`KEY_FILE` 都沒設時自動使用 `/cert/fullchain.pem`、`/cert/privkey.pem`（存在才用）；`.rsc` 與 compose 拿掉與預設值相同的設定 |
-| ⚠️ | `ALLOWED_HOSTS` 的 Host 檢查已實作（不符回 `404`，`allowedHost()`），但還沒有 `bad_host` 事件與封鎖，等封鎖機制接上；嚴格 SNI（§3.6）尚未實作 |
-| ❌ | 封鎖機制 F1～F5、slog、嚴格 SNI、body 上限、HSTS、上游逾時、header 上限、驗證頁安全標頭、`__Host-` cookie、`config`、`gate_test.go`、CI 排程與 `go test`／`govulncheck`／action 釘選 SHA、`docs/blocking.md`、`CHANGES-blocking.md`、U6 |
+| ✅ | §3.6 第一層：body 上限（4 KB → 413）、header 上限（64 KB）、`loadConfig`、`gate_test.go`（現有函式）、CI 每週重建與 `go test -race`／`govulncheck` |
+| ⚠️ | `ALLOWED_HOSTS` 的 Host 檢查已實作（不符回 `404`，`allowedHost()`），但還沒有 `bad_host` 事件與封鎖，等封鎖機制接上 |
+| 🟡 | §3.6 第二層（建議）：嚴格 SNI、上游逾時、驗證頁三個安全標頭、action 釘選 SHA |
+| ❌ | 封鎖機制 F1～F5、slog、`docs/blocking.md`、`CHANGES-blocking.md`、U6 |
 
-本文件以外已完成（安全掃描與部署修正）：`safeNext` 先整理路徑再檢查（open redirect）、`BYPASS_PREFIXES` 不放行含 `..` 的路徑、SIGTERM 正常關機、`.rsc` 的 `gateKey` 留空自動產生、RouterOS 7.24+ 語法、從 GHCR 拉映像與 `repull` 更新。
+本文件以外已完成（安全掃描與部署修正）：`safeNext` 先整理路徑再檢查（open redirect）、`BYPASS_PREFIXES` 不放行含 `..` 的路徑、SIGTERM 正常關機、`.rsc` 的 `gateKey` 留空自動產生、RouterOS 7.24+ 語法、從 GHCR 拉映像與 `repull` 更新、驗證頁改用 Idol Live Kit 視覺（嵌入 5 KB 標題字型子集 `fonts/gate-heading.woff2`）。
+
+§3.6 依「必要性」分三層（2026-10-30 檢討）：第一層有實際風險或是安全修改程式的前提；第二層便宜、效益實在但不急；HSTS、完整 CSP、`__Host-` cookie、刪上游 `Server` 標頭對本部署屬理論風險，移到 §8。
 
 ---
 
@@ -97,7 +101,6 @@ TLS 握手（certLoader 熱更新）── 設了 ALLOWED_HOSTS 且 SNI 不在�
   │
   ▼
 handler
-  ├─ 加上 HSTS
   ├─ 來源 IP 封鎖中？（keep-alive 連線、TRUST_CF_HEADER 時）──是──→ 403 + Connection: close
   ├─ Host 不在 ALLOWED_HOSTS ───────→ 事件 bad_host → 封鎖 → 404
   ├─ GET /__gate ─────────────────→ 驗證頁
@@ -119,7 +122,7 @@ handler
 | 事件 | 觸發條件 | 處理 | 為什麼真人不會觸發 |
 |---|---|---|---|
 | `bad_host` | 設定了 `ALLOWED_HOSTS`，且 TLS 的 SNI 或 `Host`（去掉 port、不分大小寫）不在清單內 | 立即封鎖；SNI 不符時中斷握手，`Host` 不符時回 `404` | 真人只會用網域連線；直接打 IP 的是掃描器 |
-| `bad_cookie` | 閘門 cookie（`__Host-gate`／`__gate`）格式錯誤：沒有 `.`、到期時間不是數字、簽章不是 64 字元 hex | 立即封鎖，回 `403` | 閘門自己發的 cookie 格式永遠正確，換金鑰也不會改變格式 |
+| `bad_cookie` | `__gate` cookie 格式錯誤：沒有 `.`、到期時間不是數字、簽章不是 64 字元 hex | 立即封鎖，回 `403` | 閘門自己發的 cookie 格式永遠正確，換金鑰也不會改變格式 |
 | `verify_fail` | siteverify 回 `success=false`，且錯誤碼不是 `internal-error` 或 `*-secret`；或 token 為空；或 hostname 不符 | 10 分鐘內第 1 次只記錄，第 2 次封鎖 | 重新整理、按上一頁偶爾造成一次 `timeout-or-duplicate`，不會連續發生 |
 
 **cookie 狀態**（取代 `validCookie()`）：
@@ -199,18 +202,17 @@ func (l blockListener) Accept() (net.Conn, error) {
 
 | 項目 | 設計 |
 |---|---|
-| 日誌 | 改用 `log/slog` 的 JSON handler 輸出到 stdout。`LOG_LEVEL` 預設 `info`：只記錄事件、封鎖、錯誤、啟動與憑證載入。`debug` 才記錄每筆請求與 listener 丟棄的連線 |
+| 日誌（與封鎖機制一起做） | 改用 `log/slog` 的 JSON handler 輸出到 stdout。`LOG_LEVEL` 預設 `info`：只記錄事件、封鎖、錯誤、啟動與憑證載入。`debug` 才記錄每筆請求與 listener 丟棄的連線 |
 | `UPSTREAM_SERVER_NAME` | ✅ 已完成。設定後 `tls.Config{ServerName: 該值}`，以網域名稱驗證 DSM 憑證，忽略 `UPSTREAM_INSECURE`。兩者都設時在啟動日誌提示 |
-| 嚴格 SNI（隱身） | 設了 `ALLOWED_HOSTS` 時，`GetCertificate` 檢查 `ClientHelloInfo.ServerName`（不分大小寫），不在清單就回錯誤、**不送出憑證**，握手中斷。用 IP 盲掃的掃描器拿不到憑證，也就拿不到網域。不新增環境變數；沒設 `ALLOWED_HOSTS` 時行為不變；只在 HTTPS 模式生效。HTTP 層的 Host 檢查（404）保留，處理 SNI 正確但 `Host` 不同的請求。同 nginx 的 `ssl_reject_handshake on`。限制：TCP 交握仍會成功（port 看得到）；網域已在 Certificate Transparency 日誌公開，擋不住從那裡拿到網域的掃描器 |
-| body 上限 | `verify()` 開頭 `r.Body = http.MaxBytesReader(w, r.Body, 4<<10)`；`ParseForm` 失敗回 `413`。Turnstile token 最長約 2 KB，4 KB 足夠 |
-| HSTS | 只在 HTTPS 模式加上 `Strict-Transport-Security: max-age=31536000`。轉發的回應在 `ModifyResponse` 先刪掉 DSM 自己的 HSTS，避免重複標頭；同一處一併刪掉上游的 `Server` 標頭，不透露後端軟體 |
-| 上游逾時 | 上游 `http.Transport` 加 `DialContext`（`net.Dialer{Timeout: 5s}`）與 `TLSHandshakeTimeout: 10s`，後端卡住時不耗光 goroutine。**不設** `ResponseHeaderTimeout`，避免切斷 DSM 長輪詢與大檔下載 |
-| header 上限 | `http.Server.MaxHeaderBytes` 由預設 1 MB 改為 64 KB |
-| 驗證頁安全標頭 | 只加在 `/__gate` 回應（不加在轉發的回應）：`Content-Security-Policy`（`script-src`／`frame-src` 只允許 `challenges.cloudflare.com`，`frame-ancestors 'none'`）、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer` |
-| cookie 名稱 | HTTPS 模式改用 `__Host-gate`：瀏覽器強制 `Secure`、`Path=/`、不可帶 `Domain`，子網域與中間人無法覆寫。HTTP 模式維持 `__gate`（`__Host-` 必須搭配 `Secure`）。改名後所有人重新驗證一次。`stripGateCookie` 兩個名稱都要移除 |
+| 嚴格 SNI（隱身）🟡 第二層 | 設了 `ALLOWED_HOSTS` 時，`GetCertificate` 檢查 `ClientHelloInfo.ServerName`（不分大小寫），不在清單就回錯誤、**不送出憑證**，握手中斷。用 IP 盲掃的掃描器拿不到憑證，也就拿不到網域。不新增環境變數；沒設 `ALLOWED_HOSTS` 時行為不變；只在 HTTPS 模式生效。HTTP 層的 Host 檢查（404）保留，處理 SNI 正確但 `Host` 不同的請求。同 nginx 的 `ssl_reject_handshake on`。限制：TCP 交握仍會成功（port 看得到）；網域已在 Certificate Transparency 日誌公開，擋不住從那裡拿到網域的掃描器 |
+| body 上限 ✅ | `verify()` 開頭 `r.Body = http.MaxBytesReader(w, r.Body, 4<<10)`；超過時回 `413`。Turnstile token 最長約 2 KB，4 KB 足夠。理由：`ParseForm` 預設讀到 10 MB，在 `GOMEMLIMIT=48MiB` 下幾個並發 POST 就有記憶體壓力 |
+| 上游逾時 🟡 第二層 | 上游 `http.Transport` 加 `DialContext`（`net.Dialer{Timeout: 5s}`）與 `TLSHandshakeTimeout: 10s`，後端卡住時不耗光 goroutine。**不設** `ResponseHeaderTimeout`，避免切斷 DSM 長輪詢與大檔下載 |
+| header 上限 ✅ | `http.Server.MaxHeaderBytes` 由預設 1 MB 改為 64 KB |
+| 驗證頁安全標頭 🟡 第二層 | 只加在 `/__gate` 回應（不加在轉發的回應）：`Content-Security-Policy: frame-ancestors 'none'`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`。**不做完整 CSP**：頁面有內嵌 script，要 hash／nonce，還要列 Turnstile 與字型來源，改頁面時容易漏改而壞掉；頁面沒有敏感操作、樣板已跳脫，效益低（見 §8） |
 | Go 版本 | `go.mod` 改成 `go 1.25`，與 Dockerfile 的 `golang:1.25-alpine` 一致（Dockerfile 已由 dependabot 升到 1.25；之後 dependabot 升 Dockerfile 時一併更新 `go.mod`） |
-| 設定 | 新增 `type config struct` 與 `loadConfig() (*config, error)`，在 `main()` 呼叫。package `var` 不再讀環境變數。handler 與 `blocker` 以 `*gate` 結構持有設定，測試直接建構 |
-| CI | `build.yml` 加 `schedule: - cron: "0 3 * * 1"`（每週一重建，拿到新的 base image 與 CA）；test job 加 `go test -race ./...` 與 `govulncheck ./...`。排程觸發時 `image` job 照常推送 `latest`。所有 action 釘選 commit SHA（`uses: actions/checkout@<sha> # v7`），由 dependabot 更新 |
+| 設定 ✅ | `loadConfig() error` 在 `main()` 開頭讀環境變數並設定既有的 package 變數（`needEnv`、`parseUpstream` 回傳 error），錯誤訊息與預設值不變；`go test` 不需任何環境變數。採最小改法，沒有引入 `type config struct`／`*gate`；封鎖機制實作時若 handler 需要持有狀態再評估 |
+| CI ✅（釘選 SHA 為 🟡 第二層） | `build.yml` 加 `schedule: - cron: "0 3 * * 1"`（每週一重建，帶入 Go、alpine、CA 的修補版：`golang:1.25-alpine` tag 會跟上 1.25.x，但映像要重建才吃得到）；test job 加 `go test -race ./...` 與 `govulncheck ./...`（`govulncheck@v1.1.4`，固定版本）。排程觸發時 `image` job 照常推送 `latest`，`routeros-tar` 也會每週產出 artifact。第二層：所有 action 釘選 commit SHA（`uses: actions/checkout@<sha> # v7`），由 dependabot 更新 |
+| 測試 ✅ | `gate_test.go` 涵蓋現有函式：`safeNext`（含 `/./\evil.com`、TAB／LF／CR，並檢查 `http.Redirect` 寫出的 Location）、`hasDotDot`、`allowedHost`、cookie 簽章（有效、過期、竄改、格式錯誤、換金鑰）、`verify` 的 body 上限與無 token 時的導向、`serveFont`。主路由的 bypass 判斷是 `main()` 內的 closure，未直接測試（組成函式皆已覆蓋）。封鎖機制的測試見 §6 第 7 項 |
 
 ### 3.7 檔案配置
 
@@ -218,10 +220,10 @@ func (l blockListener) Accept() (net.Conn, error) {
 
 | 檔案 | 變更 |
 |---|---|
-| `main.go` | 加入 `config`／`loadConfig`、`blocker`、`blockListener`、`cookieState`、Host 檢查、slog、上游憑證驗證、body 上限、HSTS |
-| `gate_test.go` | **新增**。測試檔不需要進映像，`Dockerfile` 與 `.dockerignore` **不用改** |
+| `main.go` | 加入 `blocker`、`blockListener`、`cookieState`、slog、嚴格 SNI、上游逾時、驗證頁安全標頭（✅ 已有：`loadConfig`、Host 檢查、上游憑證驗證、body 與 header 上限） |
+| `gate_test.go` | ✅ 已新增（現有函式）；封鎖機制完成後補上事件、封鎖時長、`blockListener`。測試檔不進映像（Dockerfile 只複製 `go.mod`、`main.go`、`fonts/`） |
 | `go.mod` | ✅ `go 1.25` |
-| `.github/workflows/build.yml` | 每週排程、`go test -race`、`govulncheck` |
+| `.github/workflows/build.yml` | ✅ 每週排程、`go test -race`、`govulncheck`；第二層：action 釘選 SHA |
 | `deploy/mikrotik-gate.rsc` | 見 §3.8 |
 | `deploy/docker-compose.yml` | ✅ 已完成 |
 | `README.md` | 特色加「自動封鎖」；環境變數表；新增「封鎖機制」小節；建置段落加測試指令 |
@@ -283,14 +285,14 @@ func (l blockListener) Accept() (net.Conn, error) {
 
 | 順序 | 項目 | 驗收條件 |
 |:-:|---|---|
-| 1 | `go.mod`、`config`／`loadConfig` | `go test ./...` 不設任何環境變數也能跑 |
+| 1 | ✅ `go.mod`、`loadConfig` | `go test ./...` 不設任何環境變數也能跑 |
 | 2 | slog | 預設等級下，連續 100 個無 cookie 的 API 請求不產生任何日誌 |
 | 3 | `cookieState` | 更換 `GATE_KEY` 後帶舊 cookie：瀏覽器被導向驗證頁且 cookie 被清除，IP 未被封鎖 |
 | 4 | `blocker`、`ALLOWED_HOSTS`、三種事件 | 錯誤 Host 1 次即封鎖；`verify_fail` 第 1 次不封、10 分鐘內第 2 次封鎖；私有 IP 永不封鎖；favicon 與無 cookie 的 API 請求不產生事件 |
 | 5 | `blockListener`、累犯加重 | 被封鎖的 IP 連線 TLS 握手失敗（`curl` 顯示連線被重設）；7 天內第 2 次封鎖 24 小時、第 3 次 7 天；`TRUST_CF_HEADER=1` 時不包 listener，改回 403 |
-| 6 | 嚴格 SNI、body 上限、HSTS、上游逾時、header 上限、驗證頁安全標頭、`__Host-` cookie（上游憑證驗證已完成） | `openssl s_client -connect <IP>:8443`（不帶 `-servername`）與錯誤的 `-servername` 都拿不到憑證，正確網域正常；5 KB body 回 413；HTTPS 回應只有一個 HSTS 標頭且沒有上游 `Server`；上游 IP 連不上（不回 SYN-ACK）時約 5 秒回 502；65 KB header 回 431；`/__gate` 帶 CSP 等標頭、轉發的回應不帶；HTTPS 模式發 `__Host-gate`，舊 `__gate` cookie 只讓使用者重新驗證一次 |
-| 7 | `gate_test.go` | 涵蓋 `safeNext`（含 `/./\evil.com`、TAB 等繞過案例）、`hasDotDot`、`cookieState` 五種狀態、事件與封鎖時長（以可注入的 `now` 測試）、私有 IP、Host 檢查、`blockListener`、body 上限 |
-| 8 | CI | YAML 語法正確；`govulncheck` 在本機可跑；所有 `uses:` 都是 commit SHA，dependabot 能開出更新 PR |
+| 6 | 嚴格 SNI、上游逾時、驗證頁三個安全標頭（✅ 已完成：上游憑證驗證、body 上限、header 上限） | `openssl s_client -connect <IP>:8443`（不帶 `-servername`）與錯誤的 `-servername` 都拿不到憑證，正確網域正常；上游 IP 連不上（不回 SYN-ACK）時約 5 秒回 502；`/__gate` 帶 `frame-ancestors`、`nosniff`、`Referrer-Policy`，轉發的回應不帶 |
+| 7 | `gate_test.go`（✅ 現有函式已涵蓋） | 補上 `cookieState` 五種狀態、事件與封鎖時長（以可注入的 `now` 測試）、私有 IP、`blockListener` |
+| 8 | CI（✅ 排程、`go test -race`、`govulncheck`） | 所有 `uses:` 都是 commit SHA，dependabot 能開出更新 PR |
 | 9 | `.rsc`、compose、文件 | 文件中的環境變數與程式一致；`grep -r UPSTREAM_INSECURE` 只剩說明「可選」的地方 |
 | 10 | `CHANGES-blocking.md` | 包含摘要、行為變更、環境變數、檔案異動、升級注意事項、驗證狀態 |
 
@@ -334,3 +336,8 @@ CGO_ENABLED=0 GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o gate-arm64 .
 - **閘門升級頻繁導致封鎖表常被清空**：考慮把封鎖表定期寫到掛載的磁碟。
 - **IPv6 流量明顯增加**：封鎖鍵改成 IPv6 `/64` 前綴。
 - **慢速掃描器成為困擾**：再評估加入低權重事件，但必須先有實際日誌數據證明不會誤封。
+- **開放 port 80 或加入 HTTP→HTTPS 轉址**：加上 HSTS（`Strict-Transport-Security: max-age=31536000`，HTTPS 模式；轉發時在 `ModifyResponse` 刪掉 DSM 自己的 HSTS 避免重複）。目前 port 80 未轉發、DSM 登入後本身就送 HSTS，降級攻擊空間很小。
+- **驗證頁加入使用者輸入或第三方內容**：再評估完整 CSP（內嵌 script 改用 hash／nonce，列出 Turnstile 與字型來源）。
+- **改用不在 public suffix list 上的自有網域**：評估 HTTPS 模式改用 `__Host-gate` cookie（瀏覽器強制 `Secure`、`Path=/`、不可帶 `Domain`；改名會讓所有人重新驗證一次，`stripGateCookie` 兩個名稱都要移除）。目前 cookie 有 HMAC 簽章，注入的 cookie 本來就無效。
+- **刪除上游 `Server` 標頭**：只有通過驗證的人看得到上游回應，目前效益接近零；有需要時在 `ModifyResponse` 刪除。
+- **`verify_fail` 與共用 IP**：同一 CGNAT IP 後兩人各失敗一次就會一起被封；實作封鎖機制時評估提高門檻，或只讓 `bad_host`、`bad_cookie`、`decoy_hit` 觸發封鎖。

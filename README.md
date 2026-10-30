@@ -135,4 +135,6 @@ GitHub Actions 會在推送到 `main` 時發布 `ghcr.io/sinnoken/turnstile-gate
 
 [MIT](LICENSE)
 
+驗證頁標題字型為 [Chiron GoRound TC](https://github.com/chiron-fonts/chiron-go-round-tc)，以 SIL OFL 1.1 授權（見 [fonts/OFL.txt](fonts/OFL.txt)）。
+
 本專案與 Cloudflare、Synology、MikroTik 無關聯；各商標屬其所有人。

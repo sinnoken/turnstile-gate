@@ -6,6 +6,9 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  # 每週重建，帶入 Go、alpine、CA 憑證的修補版本
+  schedule:
+    - cron: "0 3 * * 1"
 
 permissions:
   contents: read
@@ -23,6 +26,9 @@ jobs:
           go-version-file: go.mod
           cache: false   # 沒有外部依賴（無 go.sum），不需要快取
       - run: go vet ./...
+      - run: go test -race ./...
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+      - run: govulncheck ./...
       - run: CGO_ENABLED=0 go build -o /dev/null .
 
   # 多架構映像推到 GHCR（PR 只建置不推送）
