@@ -7,7 +7,7 @@
 | 狀態 | 項目 |
 |:-:|---|
 | ✅ | F6／§3.6 `UPSTREAM_SERVER_NAME`（`a79bdd2`）；`.rsc` 加 `domain`、刪 `UPSTREAM_INSECURE`；compose 改用 `UPSTREAM_SERVER_NAME` |
-| ✅ | §3.8／compose 加 `ALLOWED_HOSTS`；`GOMEMLIMIT=48MiB` 改為 Dockerfile 的 `ENV` 預設；`go.mod` 改 `go 1.25` |
+| ✅ | §3.8／compose 加 `ALLOWED_HOSTS`；`GOMEMLIMIT=48MiB` 改為 Dockerfile 的 `ENV` 預設；`go.mod` 改 `go 1.27` |
 | ✅ | 預設值：`CERT_FILE`／`KEY_FILE` 都沒設時自動使用 `/cert/fullchain.pem`、`/cert/privkey.pem`（存在才用）；`.rsc` 與 compose 拿掉與預設值相同的設定 |
 | ✅ | §3.6 第一層：body 上限（4 KB → 413）、header 上限（64 KB）、`loadConfig`、`gate_test.go`（現有函式）、CI 每週重建與 `go test -race`／`govulncheck` |
 | ⚠️ | `ALLOWED_HOSTS` 的 Host 檢查已實作（不符回 `404`，`allowedHost()`），但還沒有 `bad_host` 事件與封鎖，等封鎖機制接上 |
@@ -209,9 +209,9 @@ func (l blockListener) Accept() (net.Conn, error) {
 | 上游逾時 🟡 第二層 | 上游 `http.Transport` 加 `DialContext`（`net.Dialer{Timeout: 5s}`）與 `TLSHandshakeTimeout: 10s`，後端卡住時不耗光 goroutine。**不設** `ResponseHeaderTimeout`，避免切斷 DSM 長輪詢與大檔下載 |
 | header 上限 ✅ | `http.Server.MaxHeaderBytes` 由預設 1 MB 改為 64 KB |
 | 驗證頁安全標頭 🟡 第二層 | 只加在 `/__gate` 回應（不加在轉發的回應）：`Content-Security-Policy: frame-ancestors 'none'`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`。**不做完整 CSP**：頁面有內嵌 script，要 hash／nonce，還要列 Turnstile 與字型來源，改頁面時容易漏改而壞掉；頁面沒有敏感操作、樣板已跳脫，效益低（見 §8） |
-| Go 版本 | `go.mod` 改成 `go 1.25`，與 Dockerfile 的 `golang:1.25-alpine` 一致（Dockerfile 已由 dependabot 升到 1.25；之後 dependabot 升 Dockerfile 時一併更新 `go.mod`） |
+| Go 版本 | `go.mod` 為 `go 1.27`，與 Dockerfile 的 `golang:1.27-alpine` 一致。Go 只維護最新兩個大版本，舊版不再收到安全修補（2026-10-30 CI 的 `govulncheck` 在 go1.25.14 抓到 net/http、crypto/tls、crypto/x509 等 10 個只修在 1.26.9 以後的漏洞）。新大版本推出時（約每年 2 月、8 月），`go.mod` 與 Dockerfile 一起升 |
 | 設定 ✅ | `loadConfig() error` 在 `main()` 開頭讀環境變數並設定既有的 package 變數（`needEnv`、`parseUpstream` 回傳 error），錯誤訊息與預設值不變；`go test` 不需任何環境變數。採最小改法，沒有引入 `type config struct`／`*gate`；封鎖機制實作時若 handler 需要持有狀態再評估 |
-| CI ✅（釘選 SHA 為 🟡 第二層） | `build.yml` 加 `schedule: - cron: "0 3 * * 1"`（每週一重建，帶入 Go、alpine、CA 的修補版：`golang:1.25-alpine` tag 會跟上 1.25.x，但映像要重建才吃得到）；test job 加 `go test -race ./...` 與 `govulncheck ./...`（`govulncheck@v1.1.4`，固定版本）。排程觸發時 `image` job 照常推送 `latest`，`routeros-tar` 也會每週產出 artifact。第二層：所有 action 釘選 commit SHA（`uses: actions/checkout@<sha> # v7`），由 dependabot 更新 |
+| CI ✅（釘選 SHA 為 🟡 第二層） | `build.yml` 加 `schedule: - cron: "0 3 * * 1"`（每週一重建，帶入 Go、alpine、CA 的修補版：`golang:1.27-alpine` tag 會跟上 1.27.x，但映像要重建才吃得到）；test job 加 `go test -race ./...` 與 `govulncheck ./...`（`govulncheck@v1.1.4`，固定版本）。排程觸發時 `image` job 照常推送 `latest`，`routeros-tar` 也會每週產出 artifact。第二層：所有 action 釘選 commit SHA（`uses: actions/checkout@<sha> # v7`），由 dependabot 更新 |
 | 測試 ✅ | `gate_test.go` 涵蓋現有函式：`safeNext`（含 `/./\evil.com`、TAB／LF／CR，並檢查 `http.Redirect` 寫出的 Location）、`hasDotDot`、`allowedHost`、cookie 簽章（有效、過期、竄改、格式錯誤、換金鑰）、`verify` 的 body 上限與無 token 時的導向、`serveFont`。主路由的 bypass 判斷是 `main()` 內的 closure，未直接測試（組成函式皆已覆蓋）。封鎖機制的測試見 §6 第 7 項 |
 
 ### 3.7 檔案配置
@@ -222,7 +222,7 @@ func (l blockListener) Accept() (net.Conn, error) {
 |---|---|
 | `main.go` | 加入 `blocker`、`blockListener`、`cookieState`、slog、嚴格 SNI、上游逾時、驗證頁安全標頭（✅ 已有：`loadConfig`、Host 檢查、上游憑證驗證、body 與 header 上限） |
 | `gate_test.go` | ✅ 已新增（現有函式）；封鎖機制完成後補上事件、封鎖時長、`blockListener`。測試檔不進映像（Dockerfile 只複製 `go.mod`、`main.go`、`fonts/`） |
-| `go.mod` | ✅ `go 1.25` |
+| `go.mod` | ✅ `go 1.27` |
 | `.github/workflows/build.yml` | ✅ 每週排程、`go test -race`、`govulncheck`；第二層：action 釘選 SHA |
 | `deploy/mikrotik-gate.rsc` | 見 §3.8 |
 | `deploy/docker-compose.yml` | ✅ 已完成 |

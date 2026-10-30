@@ -1,5 +1,5 @@
 # 最小化映像（scratch），適合 RouterOS container 這種儲存空間有限的環境
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETOS TARGETARCH TARGETVARIANT
 RUN apk add --no-cache ca-certificates
 WORKDIR /src

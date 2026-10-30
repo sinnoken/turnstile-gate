@@ -93,6 +93,10 @@ func main() {
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(upstream)
 			r.Out.Host = r.In.Host
+			// DSM 信任閘門轉來的 IP 標頭；用戶端自帶的同類標頭一律刪掉，避免偽造 IP 繞過 DSM 的自動封鎖
+			for _, h := range []string{"Forwarded", "X-Client-IP", "True-Client-IP", "X-Cluster-Client-IP", "CF-Connecting-IP", "X-Original-Forwarded-For"} {
+				r.Out.Header.Del(h)
+			}
 			ip := clientIP(r.In)
 			r.Out.Header.Set("X-Real-IP", ip)
 			r.Out.Header.Set("X-Forwarded-For", ip)
@@ -293,12 +297,15 @@ func verify(w http.ResponseWriter, r *http.Request) {
 	next := safeNext(r.PostFormValue("next"))
 	token := r.PostFormValue("cf-turnstile-response")
 
-	ok, err := siteverify(token, clientIP(r), r.Host)
-	if err != nil {
-		log.Printf("siteverify error: %v", err)
-	}
+	ip := clientIP(r)
+	ok, err := siteverify(token, ip, r.Host)
 	if !ok {
-		log.Printf("verify failed ip=%s", clientIP(r))
+		// 一行記下 IP 與原因（Cloudflare 的 error-codes、連線錯誤或沒有 token），方便日後統計
+		reason := "empty token"
+		if err != nil {
+			reason = err.Error()
+		}
+		log.Printf("verify failed ip=%s reason=%q", ip, reason)
 		http.Redirect(w, r, "/__gate?err=1&next="+url.QueryEscape(next), http.StatusSeeOther)
 		return
 	}
