@@ -27,8 +27,12 @@ jobs:
           cache: false   # 沒有外部依賴（無 go.sum），不需要快取
       - run: go vet ./...
       - run: go test -race ./...
-      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-      - run: govulncheck ./...
+      # Go 團隊維護的 action，自動安裝最新的 govulncheck（舊版可能看不懂新版 Go 的語法而 panic）
+      - uses: golang/govulncheck-action@v1
+        with:
+          repo-checkout: false
+          go-version-file: go.mod
+          cache: false
       - run: CGO_ENABLED=0 go build -o /dev/null .
 
   # 多架構映像推到 GHCR（PR 只建置不推送）
