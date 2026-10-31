@@ -1,5 +1,6 @@
 # 一般 Docker 主機（例如 NAS 的 Container Manager）用。
 # MikroTik RouterOS 請改看 docs/deploy-mikrotik.md
+# 各變數的作用與預設值見 README.md「設定」；這裡只放範例值
 services:
   gate:
     image: ghcr.io/sinnoken/turnstile-gate:latest   # 或改成 build: ..
@@ -13,15 +14,15 @@ services:
       TURNSTILE_SECRET: "0x4AAAA..."
       GATE_KEY: ""             # 必填：貼上 openssl rand -hex 32 的結果，不要沿用範例字串
       UPSTREAM: "https://192.168.1.10:5001"
-      UPSTREAM_SERVER_NAME: "你的網域"   # 以網域驗證後端憑證（DSM 已套用該網域憑證時）
-      # UPSTREAM_INSECURE: "1"  # 後端只有自簽憑證時才改用這行（不驗證憑證）
-      ALLOWED_HOSTS: "你的網域"   # 其他 Host 回 421；HTTPS 時 SNI 不符直接中斷握手
+      UPSTREAM_SERVER_NAME: "你的網域"
+      # UPSTREAM_INSECURE: "1"  # 取代上一行；不驗證後端憑證
+      ALLOWED_HOSTS: "你的網域"
       # 以下為預設值，需要時才設：
-      # CERT_FILE: "/cert/fullchain.pem"   # 與 KEY_FILE 都沒設時，/cert 下有這兩個檔就自動使用
+      # CERT_FILE: "/cert/fullchain.pem"
       # KEY_FILE: "/cert/privkey.pem"
       # SESSION_HOURS: "12"
       # GOMEMLIMIT: "48MiB"
       # BYPASS_PREFIXES: "/webdav/"
-      # TRUST_CF_HEADER: "1"   # 僅在 Cloudflare 代理/Tunnel 後方時開啟
-      # LOG_LEVEL: "info"      # debug 會記錄每筆請求，排查問題時才開
-      # BLOCKLIST_LISTEN: ""   # 封鎖清單 JSON（給路由器拉取，目前只有 MikroTik 範例）；只填內部位址，且不要對外開 port
+      # TRUST_CF_HEADER: "1"   # 直接對外時不要開
+      # LOG_LEVEL: "info"
+      # BLOCKLIST_LISTEN: ""   # 只填內部位址，不要對外開 port

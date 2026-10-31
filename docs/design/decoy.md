@@ -134,7 +134,7 @@ Host 檢查（ALLOWED_HOSTS）── 不符 ──→ 421（不算事件）
 | 同時處理的誘餌請求 | 64（`chan struct{}` 當 semaphore） | `Close()` |
 | 單一請求存活時間 | 延遲 ≤ 3 秒 + 寫出，另設 `http.TimeoutHandler` 10 秒 | 中斷 |
 | 回應大小 | 頁面約 2 KB | — |
-| 每 IP 同時連線 | 路由器 `connection-limit=20,32` | 防火牆處理 |
+| 每 IP 同時連線 | 路由器速率限制（[deploy-mikrotik.md](../deploy-mikrotik.md#速率限制)） | 防火牆處理 |
 
 估算：64 × 數 KB ＋ goroutine ≈ 1～2 MB，在 `GOMEMLIMIT=48MiB` 內。最壞情況等同封鎖（名額滿就 `Close()`）。
 
@@ -142,11 +142,11 @@ Host 檢查（ALLOWED_HOSTS）── 不符 ──→ 421（不算事件）
 
 | 封鎖機制（[docs/blocking.md](../blocking.md)） | 變更 |
 |---|---|
-| 「什麼會被封鎖」的事件 | 新增 `decoy_hit`：打到誘餌路徑（與 `bad_cookie`、`verify_fail` 並列） |
+| [「什麼會被封鎖」](../blocking.md#什麼會被封鎖)的事件 | 新增 `decoy_hit`：打到誘餌路徑（與 `bad_cookie`、`verify_fail` 並列） |
 | 封鎖表 `offender` | 新增 `decoy` 到期時間（與 `until` 並列）。進入 decoy 的 IP 之後打任何路徑都只看到登入頁 |
 | decoy 時效 | 24 小時，不累犯加重（目的是收集情報，不是懲罰） |
-| 「封鎖時長」的私有 IP 規則 | 一樣永不標記；私有 IP 打到誘餌路徑只回 `404`，不進誘餌 |
-| listener 層封鎖（「兩層封鎖」A） | 不變。被**封鎖**的 IP 仍在 listener 層 `Close()`；只有 **decoy** 狀態的 IP 會進到 handler |
+| [「封鎖時長」](../blocking.md#封鎖時長)的私有 IP 規則 | 一樣永不標記；私有 IP 打到誘餌路徑只回 `404`，不進誘餌 |
+| listener 層封鎖（[「兩層封鎖」](../blocking.md#兩層封鎖) A） | 不變。被**封鎖**的 IP 仍在 listener 層 `Close()`；只有 **decoy** 狀態的 IP 會進到 handler |
 
 ## 4. 風險
 
@@ -171,7 +171,7 @@ Host 檢查（ALLOWED_HOSTS）── 不符 ──→ 421（不算事件）
 | 7 | `gate_test.go` | 涵蓋 1～6（`now` 可注入，延遲可在測試中設為 0） |
 | 8 | 文件 | `docs/blocking.md` 加一節誘餌說明；README 特色一行 |
 
-**上線後修正清單：** 以 `LOG_LEVEL=debug` 跑一到兩週，統計「沒有 cookie、非正常流程」的請求路徑，把常見的補進清單、把從未出現的移除。info 等級不記錄這類請求（[docs/blocking.md](../blocking.md)「日誌」）。
+**上線後修正清單：** 以 `LOG_LEVEL=debug` 跑一到兩週，統計「沒有 cookie、非正常流程」的請求路徑，把常見的補進清單、把從未出現的移除。info 等級不記錄這類請求（[docs/blocking.md「日誌」](../blocking.md#日誌)）。
 
 ### 每次更新誘餌清單的檢查
 
@@ -182,7 +182,7 @@ Host 檢查（ALLOWED_HOSTS）── 不符 ──→ 421（不算事件）
 
 ## 6. 日後要重新檢視的地方
 
-- **誘餌名額常常是滿的**：先確認路由器端封鎖（[docs/blocking.md](../blocking.md)「兩層封鎖」B）有在運作，而不是調大名額。
+- **誘餌名額常常是滿的**：先確認路由器端封鎖（[docs/blocking.md「兩層封鎖」](../blocking.md#兩層封鎖) B）有在運作，而不是調大名額。
 - **出現真人被導到誘餌頁的回報**：立即檢查清單是否誤含上游路徑，並縮短 decoy 時效。
 - **日誌顯示大量 POST 集中在某些端點**：可針對那些端點回更接近原產品的失敗格式，讓工具多試幾次——先確認情報價值值得這份維護成本。
 - **`/.env`、`/.git/config` 常被打**：評估回假檔案內容。

@@ -58,7 +58,7 @@ B 壞了（腳本錯、閘門沒回應）A 照常運作；address-list 項目都
 
 ## 封鎖清單 JSON
 
-設定 `BLOCKLIST_LISTEN`（例：`172.17.0.2:9090`）才啟用，**沒設就不監聽**。只放內部位址，不要對外轉發。
+設定 `BLOCKLIST_LISTEN`（例：`172.17.0.2:9090`；變數說明見 [README 設定](../README.md#設定)）才啟用，沒設就不監聽。
 
 ```
 GET /blocklist.json      Cache-Control: no-store；只接受 GET
@@ -81,14 +81,14 @@ RouterOS `/tool/fetch output=user` 最多讀回 64512 bytes（63 KiB），超過
 
 ## 日誌
 
-JSON 格式（`log/slog`）輸出到 stdout，RouterOS 會寫進 `/log`（`topics~"container"`）。每個欄位有名稱，使用者字串會自動跳脫；不記錄 cookie 值與 token。
+等級由 `LOG_LEVEL` 設定（見 [README 設定](../README.md#設定)）。JSON 格式（`log/slog`）輸出到 stdout，RouterOS 會寫進 `/log`（`topics~"container"`）。每個欄位有名稱，使用者字串會自動跳脫；不記錄 cookie 值與 token。
 
 | `LOG_LEVEL` | 記錄什麼 |
 |---|---|
-| `debug` | 每筆請求（`request`）、listener 丟棄的連線（`dropped`）、SNI 不符的握手（`sni rejected`）、`Host` 不符（`misdirected`） |
-| `info`（預設） | 事件（`event`）、啟動（`start`、`blocklist`）、憑證載入（`certificate loaded`）、每小時一行表格大小（`table`） |
-| `warn` | 封鎖（`blocked`，`duration` 為 `1h0m0s`、`24h0m0s`、`168h0m0s`）、表滿無法新增（`table full`）、封鎖清單被截斷（`blocklist truncated`） |
-| `error` | siteverify 連線或設定錯誤（`siteverify`）、上游錯誤（`upstream`）、憑證重新載入失敗（`reload cert failed, keep old`） |
+| `debug` | 每筆請求（`request`）、listener 丟棄的連線（`dropped`）、SNI 不符的握手（`sni rejected`）、其他 TLS 握手失敗（`http: TLS handshake error ...`）、`Host` 不符（`misdirected`） |
+| `info`（預設） | 事件（`event`）、啟動（`start`、`blocklist`）、關閉（`shutdown`）、憑證載入（`certificate loaded`）、每小時一行表格大小（`table`） |
+| `warn` | 封鎖（`blocked`，`duration` 為 `1h0m0s`、`24h0m0s`、`168h0m0s`）、表滿無法新增（`table full`）、封鎖清單被截斷（`blocklist truncated`）、同時設了 `UPSTREAM_SERVER_NAME` 與 `UPSTREAM_INSECURE`（`UPSTREAM_SERVER_NAME 已設定，忽略 UPSTREAM_INSECURE`） |
+| `error` | siteverify 連線或設定錯誤（`siteverify`）、上游錯誤（`upstream`；用戶端自己中斷的只記 `debug`）、憑證重新載入失敗（`reload cert failed, keep old`）、啟動失敗後結束（`config`、`listen`、`load cert`、`blocklist listen`、`blocklist serve`、`serve`，原因在 `err` 欄位） |
 
 預設等級下被掃描也不會洗掉 `/log`：沒有 cookie 的請求、SNI 與 `Host` 不符都不記錄。`debug` 只在排查問題時短暫開啟。
 
@@ -137,7 +137,7 @@ JSON 格式（`log/slog`）輸出到 stdout，RouterOS 會寫進 `/log`（`topic
 
 ## TRUST_CF_HEADER
 
-`TRUST_CF_HEADER=1`（只在 Cloudflare 代理或 Tunnel 後方開啟）時，TCP 連線來源是 Cloudflare 節點，封它等於封所有人。因此：
+`TRUST_CF_HEADER=1`（變數說明見 [README 設定](../README.md#設定)）時，TCP 連線來源是 Cloudflare 節點，封它等於封所有人。因此：
 
 - listener 層**不封鎖**，改由 handler 依 `CF-Connecting-IP` 判斷，封鎖中的 IP 回 `403`。
 - 路由器看到的來源也是 Cloudflare 節點，清單裡的真實 IP 不會直接連到路由器，路由器端封鎖沒有作用，不需要設定。

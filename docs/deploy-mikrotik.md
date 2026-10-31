@@ -55,9 +55,9 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 :local gateKey ""
 ```
 
-`domain` 是使用者連線用的網域，同時用在 `UPSTREAM_SERVER_NAME`（驗證 DSM 憑證）與 `ALLOWED_HOSTS`。設好後，用 IP 或其他網域連閘門時 TLS 握手直接被中斷（嚴格 SNI，拿不到憑證）；SNI 正確但 `Host` 不同的請求回 `421`。
+`domain` 是使用者連線用的網域，會填進 `UPSTREAM_SERVER_NAME` 與 `ALLOWED_HOSTS`；`siteKey`、`secret`、`gateKey` 分別填進 `TURNSTILE_SITEKEY`、`TURNSTILE_SECRET`、`GATE_KEY`。各變數的作用見 [README 設定](../README.md#設定)。
 
-`gateKey` 是簽 cookie 用的 `GATE_KEY`。留空時，匯入會用 `:rndstr` 自動產生 64 字元的隨機 hex 金鑰，存在容器環境變數（`/container/envs/print where key=GATE_KEY`）。要自訂就填 `openssl rand -hex 32` 的結果，會照原樣使用。
+`gateKey` 留空時，匯入會用 `:rndstr` 自動產生 64 字元的隨機 hex 金鑰，存在容器環境變數（`/container/envs/print where key=GATE_KEY`）。要自訂就填 `openssl rand -hex 32` 的結果，會照原樣使用。
 留空時每次重新匯入都會產生新金鑰，所有人需要重新驗證一次；想保留原本的金鑰，重新匯入前把它填回 `gateKey`。
 
 上傳後匯入：
@@ -146,7 +146,7 @@ chain=forward dst-address=172.17.0.2 dst-port=8443 connection-state=new action=d
 
 | 項目 | 內容 |
 |---|---|
-| env | `BLOCKLIST_LISTEN=172.17.0.2:9090`：閘門另開一個只在容器網段的 listener 提供 `/blocklist.json`。WAN 只轉 443，9090 從網際網路連不到 |
+| env | `BLOCKLIST_LISTEN=172.17.0.2:9090`（見 [README 設定](../README.md#設定)），只在容器網段監聽。WAN 只轉 443，9090 從網際網路連不到 |
 | script `gate-blocklist` | 用 `/tool/fetch` 拉清單、`:deserialize` 解析 JSON，把每個 IP 寫進 address-list `gate-block`，`timeout` = 剩餘秒數，comment = `gate: <事件> #<次數>`；已存在就更新 timeout |
 | scheduler `gate-blocklist` | 每 1 分鐘執行一次 |
 | raw 規則 `gate: blocklist` | `chain=prerouting in-interface-list=WAN src-address-list=gate-block action=drop` |
@@ -155,7 +155,7 @@ chain=forward dst-address=172.17.0.2 dst-port=8443 connection-state=new action=d
 
 - 拉取或解析失敗：該輪只記一行 `gate-blocklist: ...` warning，既有項目照 timeout 到期，下一分鐘再試。容器停止期間每分鐘會有一行，維護時間較長可先 `/system/scheduler/disable gate-blocklist`。
 - 路由器重開機：有 timeout 的 address-list 項目是動態的，會消失；閘門封鎖表仍在，下一輪補回。
-- 清單大小：`/tool/fetch output=user` 最多讀回 64512 bytes，超過會靜默截斷（RouterOS 手冊 `/tool/fetch`），閘門端已限制為 800 筆（約 58 KB，見 [blocking.md](blocking.md#封鎖清單-json)）。
+- 清單大小：閘門端已限制筆數，讓 `/tool/fetch` 讀得完，路由器端不需調整；上限與原因見 [封鎖清單 JSON](blocking.md#封鎖清單-json)。
 - raw 規則是加在 prerouting 的最後面；如果你原本有 `action=accept` 的 raw 規則會先比對到，請把 `gate: blocklist` 移到最上面。
 - device-mode 為 `home` 時不能使用 scheduler（RouterOS 手冊 Scheduler 指南），用 `/system/device-mode/print` 確認。
 
@@ -231,7 +231,7 @@ envs、掛載、網路與開機自動啟動都會保留，只換映像。新版�
 /container/envs/add list=gate key=ALLOWED_HOSTS        value="你的網域"
 ```
 
-`CERT_FILE`、`KEY_FILE`、`SESSION_HOURS`、`GOMEMLIMIT` 若與預設值相同（`/cert/fullchain.pem`、`/cert/privkey.pem`、`12`、`48MiB`），可以刪掉不設。
+`CERT_FILE`、`KEY_FILE`、`SESSION_HOURS`、`GOMEMLIMIT` 若與 [README 設定](../README.md#設定) 的預設值相同，可以刪掉不設。
 
 更新後確認：`/log/print where topics~"container"` 有 `"msg":"start"`，從外網開一次驗證頁並登入 DSM。
 
@@ -248,6 +248,16 @@ envs、掛載、網路與開機自動啟動都會保留，只換映像。新版�
 
 修正版發布後，用同樣方式指定 `:latest` 換回來。
 
+## 更換 GATE_KEY
+
+`GATE_KEY` 外洩或想讓所有人重新驗證時（影響見 [安全模型 FAQ](security.md#gate_key-外洩或想讓所有人重新驗證)），換一把新的隨機金鑰：
+
+```
+/container/stop [find comment="gate"]
+/container/envs/set [find list="gate" key="GATE_KEY"] value=[:rndstr length=64 from="0123456789abcdef"]
+/container/start [find comment="gate"]
+```
+
 ## 疑難排解
 
 | 症狀 | 可能原因 |
@@ -257,7 +267,7 @@ envs、掛載、網路與開機自動啟動都會保留，只換映像。新版�
 | 容器啟動後立刻停止，log 有 `load cert` | 憑證檔不存在或路徑錯誤 |
 | log 有 `private key does not match public key` | `fullchain.pem` 第一張不是網域憑證，或 cert 與 key 不同組。用 `openssl x509 -in fullchain.pem -noout -subject` 檢查，依[第 4 步](#4-放入憑證並啟動)重新合併 |
 | log 有 `permission denied` | 映像以 UID 65534 執行，掛載檔案權限不足。可在 Dockerfile 移除 `USER 65534` 重新打包 |
-| 驗證頁出現但一直失敗，log 有 `siteverify error` | 容器連不到外網：檢查 masquerade 是否涵蓋 `172.17.0.0/24`、DNS 是否可用（`/ip/dns` 的 `allow-remote-requests=yes`） |
+| 驗證頁出現但一直失敗，log 有 `"msg":"siteverify"`（`ERROR`） | 容器連不到外網：檢查 masquerade 是否涵蓋 `172.17.0.0/24`、DNS 是否可用（`/ip/dns` 的 `allow-remote-requests=yes`） |
 | Turnstile 元件顯示錯誤 | Turnstile 後台沒加入此網域 |
 | 直接打 IP 或用其他網域連線時 TLS 握手失敗（瀏覽器顯示連線被重設、`openssl s_client` 拿不到憑證） | 正常：嚴格 SNI 只接受 `ALLOWED_HOSTS`。改用網域連線，或確認 `domain` 沒打錯 |
 | 連線得到 `421 misdirected request` | `Host` 不在 `ALLOWED_HOSTS`（例如 SNI 正確但 `Host` 填了別的）。確認 `domain` 沒打錯；瀏覽器碰到 421 會自動另開連線重試 |

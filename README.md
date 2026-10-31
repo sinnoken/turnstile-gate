@@ -17,7 +17,7 @@
 - **可跑在路由器上**：提供 `amd64`、`arm64`、`arm/v7` 映像，附 MikroTik RouterOS v7 container 部署範例
 - **HTTPS 自帶**：讀取匯入的 PEM 憑證，檔案更新後自動重新載入，不必重啟
 - **安全預設**：伺服器端 `siteverify` 驗證、HMAC 簽章 cookie、驗證 token 網域、防 open redirect、不轉送閘門 cookie 給後端，可用網域驗證後端憑證
-- **自動封鎖**：偽造 cookie、偽造或重複送 token 的 IP 直接封鎖（1 小時起，累犯加重），可交給 MikroTik 路由器在最外層丟棄；真人不會觸發
+- **自動封鎖**：偽造 cookie、偽造或重複送 token 的 IP 直接封鎖、累犯加重，可交給 MikroTik 路由器在最外層丟棄；真人不會觸發（見 [封鎖機制](docs/blocking.md)）
 
 ## 運作原理
 
@@ -71,7 +71,7 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 
 ## 設定
 
-全部用環境變數。
+全部用環境變數。本表是環境變數的唯一說明，其他文件與範例設定檔只放範例值並連結到這裡。
 
 | 變數 | 必填 | 預設 | 說明 |
 |---|:-:|---|---|
@@ -99,17 +99,20 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 | `POST /__gate/verify` | 接收 token、呼叫 siteverify、發 cookie（body 上限 8 KB） |
 | `GET /__gate/h.woff2` | 驗證頁標題字型 |
 | 其他 | 有效 cookie → 轉發；否則瀏覽器導向驗證頁、其他請求回 `401`。`Host` 不在 `ALLOWED_HOSTS` 回 `421` |
-| `GET /blocklist.json` | 封鎖清單，只在 `BLOCKLIST_LISTEN` 的獨立位址提供 |
+| `GET /blocklist.json` | 封鎖清單，只在 `BLOCKLIST_LISTEN` 的獨立位址提供（格式見 [封鎖清單 JSON](docs/blocking.md#封鎖清單-json)） |
 
 送往後端的請求會帶 `X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`、`X-Forwarded-Host`；WebSocket 可正常轉發。
 
 ### 封鎖機制
 
-只封鎖「確定不是真人」的 IP：送出格式錯誤的 `__gate` cookie（`bad_cookie`），或送出空的、偽造的、他站的 Turnstile token（`verify_fail`）。7 天內第 1 次封 1 小時、第 2 次 24 小時、第 3 次以上 7 天；私有 IP 永不封鎖。沒有 cookie、cookie 過期、換 `GATE_KEY`、SNI 或 `Host` 不符都**不會**被封。
-
-被封鎖的 IP 在 TLS 握手前就被關閉連線。設定 `BLOCKLIST_LISTEN` 後，MikroTik 路由器可每分鐘拉取清單，在 raw prerouting 直接丟棄。查詢與解除封鎖見 [封鎖機制](docs/blocking.md)。
+- **會被封**：只有「確定不是真人」的 IP——送出格式錯誤的 `__gate` cookie，或送出空的、偽造的、他站的 Turnstile token；累犯加重（時長見 [封鎖時長](docs/blocking.md#封鎖時長)）。
+- **不會被封**：沒有 cookie、cookie 過期、換 `GATE_KEY`、SNI 或 `Host` 不符；私有 IP（從家裡內網連線）永不封鎖。
+- **被封時**：連線直接被關閉（或回 `403`）。設定 `BLOCKLIST_LISTEN` 後可交給路由器在最外層丟棄。
+- **誤封時**：重啟容器即清空封鎖表，路由器端另刪 address-list 項目，步驟見 [解除封鎖](docs/blocking.md#解除封鎖誤封時)；查誰被封見 [查詢誰被封鎖](docs/blocking.md#查詢誰被封鎖)。
 
 ## 部署指南
+
+所有文件與各自負責的內容見 [docs/README.md](docs/README.md)。
 
 - [MikroTik RouterOS v7 container](docs/deploy-mikrotik.md)：網路隔離、NAT、速率限制一次設定
 - [從 Synology DSM 自動同步 Let's Encrypt 憑證](docs/cert-sync-dsm.md)
@@ -117,10 +120,9 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 
 ## 建置
 
-```bash
-# 測試（不需要任何環境變數；CI 另外跑 go test -race）
-go test ./...
+自行建置執行檔或映像（測試與開發流程見 [開發與測試](docs/development.md)）：
 
+```bash
 # 本機
 CGO_ENABLED=0 go build -ldflags="-s -w" -o turnstile-gate .
 

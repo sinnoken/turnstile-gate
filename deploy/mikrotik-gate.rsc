@@ -1,5 +1,5 @@
 # turnstile-gate on MikroTik RouterOS v7 (e.g. RB5009 / arm64)
-# 說明文件：docs/deploy-mikrotik.md
+# 說明文件：docs/deploy-mikrotik.md；各環境變數的作用與預設值見 README.md「設定」
 # 用法：先改下面的變數 → 上傳到路由器 → /import mikrotik-gate.rsc
 # 所有新增項目的 comment 或名稱都含 "gate"，方便日後查找/移除（script 以名稱 gate-blocklist 辨識）
 {
@@ -81,7 +81,7 @@
 /container/envs/add list=gate key=UPSTREAM_SERVER_NAME value=$domain
 /container/envs/add list=gate key=ALLOWED_HOSTS     value=$domain
 /container/envs/add list=gate key=BLOCKLIST_LISTEN  value="172.17.0.2:9090"
-# 憑證（/cert/fullchain.pem、/cert/privkey.pem）、GOMEMLIMIT=48MiB、SESSION_HOURS=12 都是映像的預設值
+# 其餘變數（CERT_FILE、KEY_FILE、GOMEMLIMIT、SESSION_HOURS 等）用預設值，見 README.md「設定」
 /container/mounts/add list=gate-cert src="$disk/gate/cert" dst=/cert mode=ro
 /container/add remote-image=$image check-certificate=yes interface=veth-gate envlists=gate \
     mountlists=gate-cert root-dir="$disk/gate/root" dns=172.17.0.1 \
