@@ -4,9 +4,10 @@
 本文以 RB5009（arm64）為例，設定檔：[`deploy/mikrotik-gate.rsc`](../deploy/mikrotik-gate.rsc)。
 
 ```
-網際網路 ──443──→ MikroTik（dst-nat）──→ 容器 172.17.0.2:8443 ──HTTPS──→ NAS:5001
-                     │                        │
-                     └ 防火牆：速率限制          └ 只能連 NAS:5001、外網 443、路由器 DNS
+網際網路 ──443──→ MikroTik（raw 丟棄、dst-nat）──→ 容器 172.17.0.2:8443 ──HTTPS──→ NAS:5001
+                     │      ▲                        │
+                     │      └── 每分鐘拉封鎖清單 ──── :9090
+                     └ 防火牆：速率限制                └ 只能連 NAS:5001、外網 443、路由器 DNS
 ```
 
 ## 前置條件
@@ -54,7 +55,7 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 :local gateKey ""
 ```
 
-`domain` 是使用者連線用的網域，同時用在 `UPSTREAM_SERVER_NAME`（驗證 DSM 憑證）與 `ALLOWED_HOSTS`（其他 Host 一律 404）。設好後，用 IP 或其他網域連閘門都會得到 404。
+`domain` 是使用者連線用的網域，同時用在 `UPSTREAM_SERVER_NAME`（驗證 DSM 憑證）與 `ALLOWED_HOSTS`。設好後，用 IP 或其他網域連閘門時 TLS 握手直接被中斷（嚴格 SNI，拿不到憑證）；SNI 正確但 `Host` 不同的請求回 `421`。
 
 `gateKey` 是簽 cookie 用的 `GATE_KEY`。留空時，匯入會用 `:rndstr` 自動產生 64 字元的隨機 hex 金鑰，存在容器環境變數（`/container/envs/print where key=GATE_KEY`）。要自訂就填 `openssl rand -hex 32` 的結果，會照原樣使用。
 留空時每次重新匯入都會產生新金鑰，所有人需要重新驗證一次；想保留原本的金鑰，重新匯入前把它填回 `gateKey`。
@@ -74,9 +75,10 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 | forward 規則 | 速率限制；容器只能連 `NAS:5001` 與外網 `443` |
 | input 規則 | 容器只能查路由器 DNS，其餘一律丟棄 |
 | 使用者 | `gatecert`（只限 NAS IP、只給檔案傳輸權限），給 DSM 推送憑證用 |
-| container | envs、掛載 `<disk>/gate/cert` → `/cert`、開機自動啟動 |
+| container | envs（含 `BLOCKLIST_LISTEN=172.17.0.2:9090`）、掛載 `<disk>/gate/cert` → `/cert`、開機自動啟動 |
+| 封鎖清單 | script `gate-blocklist`、每分鐘執行的 scheduler `gate-blocklist`、raw 規則（丟棄 address-list `gate-block`）；forward 擋其他主機連 9090、input 放行清單的回應。見[封鎖清單](#封鎖清單路由器端) |
 
-所有項目的 comment 都含 `gate`，之後可用 `find comment~"gate"` 找到。
+所有項目的 comment 都含 `gate`（script 沒有 comment，以名稱 `gate-blocklist` 辨識），之後可用 `find comment~"gate"` 找到。
 
 > `br-ct` **不要**加入 `LAN` interface list，否則預設防火牆會把容器當成內網信任。
 
@@ -112,7 +114,7 @@ docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-ar
 /log/print where topics~"container"
 ```
 
-看到 `certificate loaded` 與 `HTTPS on :8443` 即成功。
+看到 `"msg":"certificate loaded"` 與 `"msg":"start","mode":"https"` 即成功（日誌為 JSON，見 [blocking.md](blocking.md#日誌)）。
 
 ### 5. DSM 端設定
 
@@ -136,6 +138,76 @@ chain=forward dst-address=172.17.0.2 dst-port=8443 connection-state=new action=d
 
 瀏覽器會用 keep-alive 重複使用連線，一般使用不會碰到上限。
 
+## 封鎖清單（路由器端）
+
+閘門判斷要封鎖的 IP（事件與時長見 [blocking.md](blocking.md)），路由器只照清單在最外層丟棄：不進 conntrack、不經 NAT、不到容器，也撐過容器重啟與 `repull`。
+
+`mikrotik-gate.rsc` 會加入：
+
+| 項目 | 內容 |
+|---|---|
+| env | `BLOCKLIST_LISTEN=172.17.0.2:9090`：閘門另開一個只在容器網段的 listener 提供 `/blocklist.json`。WAN 只轉 443，9090 從網際網路連不到 |
+| script `gate-blocklist` | 用 `/tool/fetch` 拉清單、`:deserialize` 解析 JSON，把每個 IP 寫進 address-list `gate-block`，`timeout` = 剩餘秒數，comment = `gate: <事件> #<次數>`；已存在就更新 timeout |
+| scheduler `gate-blocklist` | 每 1 分鐘執行一次 |
+| raw 規則 `gate: blocklist` | `chain=prerouting in-interface-list=WAN src-address-list=gate-block action=drop` |
+| forward 規則 `gate: blocklist router only` | 擋區網其他主機連 `172.17.0.2:9090`（路由器自己拉取走 output，不受影響）。不需要時可刪 |
+| input 規則 `gate: blocklist replies` | 放行容器回給路由器的封包（`gate: no router access` 會擋掉所有來自容器網段的 input） |
+
+- 拉取或解析失敗：該輪只記一行 `gate-blocklist: ...` warning，既有項目照 timeout 到期，下一分鐘再試。容器停止期間每分鐘會有一行，維護時間較長可先 `/system/scheduler/disable gate-blocklist`。
+- 路由器重開機：有 timeout 的 address-list 項目是動態的，會消失；閘門封鎖表仍在，下一輪補回。
+- 清單大小：`/tool/fetch output=user` 最多讀回 64512 bytes，超過會靜默截斷（RouterOS 手冊 `/tool/fetch`），閘門端已限制為 800 筆（約 58 KB，見 [blocking.md](blocking.md#封鎖清單-json)）。
+- raw 規則是加在 prerouting 的最後面；如果你原本有 `action=accept` 的 raw 規則會先比對到，請把 `gate: blocklist` 移到最上面。
+- device-mode 為 `home` 時不能使用 scheduler（RouterOS 手冊 Scheduler 指南），用 `/system/device-mode/print` 確認。
+
+查詢與解除封鎖見 [blocking.md](blocking.md#查詢誰被封鎖)。
+
+### 已部署的路由器加上封鎖清單
+
+用舊版設定檔部署的路由器，先補 env 並更新映像：
+
+```
+/container/stop [find comment="gate"]
+/container/envs/add list=gate key=BLOCKLIST_LISTEN value="172.17.0.2:9090"
+/container/repull [find comment="gate"]
+/container/print                      # 等 status 回到 stopped
+/container/start [find comment="gate"]
+```
+
+再貼上以下內容（直接貼到終端機，或存成 `.rsc` 後 `/import`）：
+
+```
+/ip/firewall/filter/add place-before=[find comment="gate: no router access"] chain=input     action=accept src-address=172.17.0.2 protocol=tcp src-port=9090     connection-state=established,related comment="gate: blocklist replies"
+/ip/firewall/filter/add place-before=[find comment="gate: container isolation"] chain=forward     action=drop dst-address=172.17.0.2 protocol=tcp dst-port=9090     comment="gate: blocklist router only"
+/system/script/add name=gate-blocklist source={
+    :onerror e in={
+        :local r [/tool/fetch url="http://172.17.0.2:9090/blocklist.json" output=user as-value]
+        :local j [:deserialize from=json value=($r->"data")]
+        :foreach it in=($j->"items") do={
+            :local ip ($it->"ip")
+            :local t [:totime (($it->"ttl") . "s")]
+            :local c ("gate: " . ($it->"event") . " #" . ($it->"strike"))
+            :local id [/ip/firewall/address-list/find list=gate-block address=$ip]
+            :if ([:len $id] = 0) do={
+                /ip/firewall/address-list/add list=gate-block address=$ip timeout=$t comment=$c
+            } else={
+                /ip/firewall/address-list/set $id timeout=$t comment=$c
+            }
+        }
+    } do={ :log warning "gate-blocklist: $e" }
+}
+/system/scheduler/add name=gate-blocklist interval=1m on-event=gate-blocklist comment="gate"
+/ip/firewall/raw/add chain=prerouting in-interface-list=WAN src-address-list=gate-block     action=drop comment="gate: blocklist"
+```
+
+確認：
+
+```
+/system/script/run gate-blocklist
+/log/print where message~"gate-blocklist"             # 沒有 warning 即正常
+/ip/firewall/address-list/print where list=gate-block  # 有人被封鎖時才會有項目
+/ip/firewall/raw/print stats where comment~"gate"      # packets 計數會增加
+```
+
 ## 從家裡連線
 
 NAT 規則只比對 `in-interface-list=WAN`，在家裡用網域連線不會被轉發。家裡請直接用 NAS 內網 IP，或自行加 hairpin NAT。
@@ -151,7 +223,7 @@ NAT 規則只比對 `in-interface-list=WAN`，在家裡用網域連線不會被�
 /container/start [find comment="gate"]
 ```
 
-envs、掛載、網路與開機自動啟動都會保留，只換映像。新版需要新的 env 時，在 `stop` 之後、`start` 之前調整 `/container/envs`，例如用舊版設定檔部署的路由器要補上：
+envs、掛載、網路與開機自動啟動都會保留，只換映像。新版需要新的 env 時，在 `stop` 之後、`start` 之前調整 `/container/envs`（封鎖清單見[上一節](#已部署的路由器加上封鎖清單)），例如用舊版設定檔部署的路由器要補上：
 
 ```
 /container/envs/remove [find list="gate" key="UPSTREAM_INSECURE"]
@@ -160,6 +232,21 @@ envs、掛載、網路與開機自動啟動都會保留，只換映像。新版�
 ```
 
 `CERT_FILE`、`KEY_FILE`、`SESSION_HOURS`、`GOMEMLIMIT` 若與預設值相同（`/cert/fullchain.pem`、`/cert/privkey.pem`、`12`、`48MiB`），可以刪掉不設。
+
+更新後確認：`/log/print where topics~"container"` 有 `"msg":"start"`，從外網開一次驗證頁並登入 DSM。
+
+### 退回舊版
+
+每個 [Release](https://github.com/sinnoken/turnstile-gate/releases) 的映像都有版本 tag（例如 `:1.0.0`）。新版有問題時，指定上一版重新拉取：
+
+```
+/container/stop [find comment="gate"]
+/container/repull [find comment="gate"] remote-image="ghcr.io/sinnoken/turnstile-gate:1.0.0"
+/container/print                      # 等 status 回到 stopped
+/container/start [find comment="gate"]
+```
+
+修正版發布後，用同樣方式指定 `:latest` 換回來。
 
 ## 疑難排解
 
@@ -172,9 +259,21 @@ envs、掛載、網路與開機自動啟動都會保留，只換映像。新版�
 | log 有 `permission denied` | 映像以 UID 65534 執行，掛載檔案權限不足。可在 Dockerfile 移除 `USER 65534` 重新打包 |
 | 驗證頁出現但一直失敗，log 有 `siteverify error` | 容器連不到外網：檢查 masquerade 是否涵蓋 `172.17.0.0/24`、DNS 是否可用（`/ip/dns` 的 `allow-remote-requests=yes`） |
 | Turnstile 元件顯示錯誤 | Turnstile 後台沒加入此網域 |
-| 連線得到 `404 page not found` | 用了 `ALLOWED_HOSTS` 以外的 Host（例如直接打 IP）。改用網域連線，或確認 `domain` 沒打錯 |
+| 直接打 IP 或用其他網域連線時 TLS 握手失敗（瀏覽器顯示連線被重設、`openssl s_client` 拿不到憑證） | 正常：嚴格 SNI 只接受 `ALLOWED_HOSTS`。改用網域連線，或確認 `domain` 沒打錯 |
+| 連線得到 `421 misdirected request` | `Host` 不在 `ALLOWED_HOSTS`（例如 SNI 正確但 `Host` 填了別的）。確認 `domain` 沒打錯；瀏覽器碰到 421 會自動另開連線重試 |
+| 自己被封鎖（連線被直接關閉，或回 `403 forbidden`） | 見 [blocking.md](blocking.md#解除封鎖誤封時)：重啟容器並刪除 `gate-block` 的項目 |
+| log 有 `gate-blocklist: ...` warning | 容器沒在跑、沒設 `BLOCKLIST_LISTEN`，或缺少 `gate: blocklist replies` input 規則（拉取逾時）。用 `/tool/fetch url="http://172.17.0.2:9090/blocklist.json" output=user` 手動測試 |
 | 502 Bad Gateway | `UPSTREAM` 位址錯誤，或 forward 規則沒放行容器到 NAS:5001 |
 | 502 Bad Gateway，log 有 `x509` 或 `failed to verify certificate` | DSM 5001 用的不是 `domain` 的有效憑證（自簽、其他網域或已過期），或 `domain` 打錯；路由器時間不正確也會讓憑證驗證失敗，用 `/system/clock/print` 確認並啟用 `/system/ntp/client` |
+
+## 建議設定
+
+| 項目 | 說明 |
+|---|---|
+| WireGuard 備援 | 在路由器開 WireGuard（`/interface/wireguard`）。閘門故障或自己被封鎖時能連回家修理；DS File、Synology Photos 等無法通過驗證頁的手機 App 也改走這條 |
+| 外部監控 | 用 UptimeRobot 等服務檢查 `https://<網域>/__gate` 可連線與憑證到期日。驗證頁不需要 cookie，回 `200` 即正常；憑證推送失敗時能提早發現 |
+| Split DNS | `/ip/dns/static/add name=<網域> address=<NAS IP>`，在家用網域連線時直接到 NAS，不需要 hairpin NAT。**會影響整個區網**：所有用路由器 DNS 的裝置都會解析到 NAS 內網 IP，繞過閘門直接連 DSM（區網本來就不經過閘門） |
+| NTP | 確認 `/system/ntp/client` 已啟用。RB5009 沒有時鐘電池，時間錯會讓 cookie 與憑證驗證失效 |
 
 ## 移除
 
@@ -185,6 +284,10 @@ envs、掛載、網路與開機自動啟動都會保留，只換映像。新版�
 /container/mounts/remove [find list="gate-cert"]
 /ip/firewall/filter/remove [find comment~"gate"]
 /ip/firewall/nat/remove [find comment~"gate"]
+/ip/firewall/raw/remove [find comment~"gate"]
+/ip/firewall/address-list/remove [find list="gate-block"]
+/system/scheduler/remove [find name="gate-blocklist"]
+/system/script/remove [find name="gate-blocklist"]
 /user/remove [find name="gatecert"]
 /user/group/remove [find name="cert-push"]
 /interface/bridge/port/remove [find interface="veth-gate"]

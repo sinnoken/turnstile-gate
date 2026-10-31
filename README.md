@@ -17,6 +17,7 @@
 - **可跑在路由器上**：提供 `amd64`、`arm64`、`arm/v7` 映像，附 MikroTik RouterOS v7 container 部署範例
 - **HTTPS 自帶**：讀取匯入的 PEM 憑證，檔案更新後自動重新載入，不必重啟
 - **安全預設**：伺服器端 `siteverify` 驗證、HMAC 簽章 cookie、驗證 token 網域、防 open redirect、不轉送閘門 cookie 給後端，可用網域驗證後端憑證
+- **自動封鎖**：偽造 cookie、偽造或重複送 token 的 IP 直接封鎖（1 小時起，累犯加重），可交給 MikroTik 路由器在最外層丟棄；真人不會觸發
 
 ## 運作原理
 
@@ -80,13 +81,15 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 | `UPSTREAM` | ✅ | | 後端位址，例：`https://192.168.1.10:5001` |
 | `UPSTREAM_INSECURE` | | 關 | `1` = 不驗證後端憑證（後端為自簽憑證時） |
 | `UPSTREAM_SERVER_NAME` | | | 以這個網域名稱驗證後端憑證（`UPSTREAM` 用 IP、後端憑證是網域憑證時，例：DSM 的 Let's Encrypt 憑證）。設定後忽略 `UPSTREAM_INSECURE` |
-| `ALLOWED_HOSTS` | | 不檢查 | 允許的網域，逗號分隔，不分大小寫、忽略 port。其他 `Host`（例如直接打 IP 的掃描器）一律回 `404`。**建議設定** |
+| `ALLOWED_HOSTS` | | 不檢查 | 允許的網域，逗號分隔，不分大小寫、忽略 port 與結尾的 `.`。其他 `Host` 一律回 `421`；HTTPS 模式下同時啟用嚴格 SNI：SNI 不在清單（例如直接打 IP 的掃描器）就中斷握手、不送出憑證。**強烈建議設定** |
 | `LISTEN` | | `:8443` | 監聽位址 |
 | `CERT_FILE` / `KEY_FILE` | | `/cert/fullchain.pem` / `/cert/privkey.pem` | PEM 憑證與私鑰。兩者都沒設時，若 `/cert` 下有這兩個檔就自動使用；都找不到則以 HTTP 監聽 |
 | `SESSION_HOURS` | | `12` | 通過驗證後 cookie 有效時數 |
 | `BYPASS_PREFIXES` | | | 免驗證的路徑前綴，逗號分隔，例：`/webdav/`（建議以 `/` 結尾）。解碼後含 `..` 片段的路徑（例：`/webdav/%2e%2e/...`）不放行 |
 | `TRUST_CF_HEADER` | | 關 | `1` = 信任 `CF-Connecting-IP`。**只在 Cloudflare 代理或 Tunnel 後方開啟**，直接對外時此標頭可被偽造 |
 | `GOMEMLIMIT` | | `48MiB` | Go runtime 的記憶體軟上限（映像預設值） |
+| `LOG_LEVEL` | | `info` | `debug`、`info`、`warn`、`error`（不分大小寫；其他值會讓啟動失敗）。`debug` 會記錄每筆請求，只在排查問題時開 |
+| `BLOCKLIST_LISTEN` | | 不啟用 | 封鎖清單 JSON（`GET /blocklist.json`）的監聽位址，給路由器拉取，例：`172.17.0.2:9090`。**只放內部位址**，不要對外轉發 |
 
 ### 端點
 
@@ -98,6 +101,12 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 
 送往後端的請求會帶 `X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`、`X-Forwarded-Host`；WebSocket 可正常轉發。
 
+### 封鎖機制
+
+只封鎖「確定不是真人」的 IP：送出格式錯誤的 `__gate` cookie（`bad_cookie`），或送出空的、偽造的、他站的 Turnstile token（`verify_fail`）。7 天內第 1 次封 1 小時、第 2 次 24 小時、第 3 次以上 7 天；私有 IP 永不封鎖。沒有 cookie、cookie 過期、換 `GATE_KEY`、SNI 或 `Host` 不符都**不會**被封。
+
+被封鎖的 IP 在 TLS 握手前就被關閉連線。設定 `BLOCKLIST_LISTEN` 後，MikroTik 路由器可每分鐘拉取清單，在 raw prerouting 直接丟棄。查詢與解除封鎖見 [封鎖機制](docs/blocking.md)。
+
 ## 部署指南
 
 - [MikroTik RouterOS v7 container](docs/deploy-mikrotik.md)：網路隔離、NAT、速率限制一次設定
@@ -107,6 +116,9 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 ## 建置
 
 ```bash
+# 測試（不需要任何環境變數；CI 另外跑 go test -race）
+go test ./...
+
 # 本機
 CGO_ENABLED=0 go build -ldflags="-s -w" -o turnstile-gate .
 

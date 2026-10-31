@@ -60,6 +60,9 @@ sh dsm-push-cert.sh
 - 使用者：`root`（讀取 `/usr/syno/etc/certificate` 需要）
 - 排程：每天一次
 - 指令：`sh /volume1/scripts/gate-cert/dsm-push-cert.sh`
+- 設定 → 通知：填寫收件信箱並勾選 **僅在指令碼異常終止時寄送通知信**（DSM 介面寫法依版本略有不同，即「僅在異常終止時寄信」）。平常沒有信，推送失敗才會收到
+
+> **萬用字元憑證**：建議在 DSM 申請 `*.your-domain`（例：`*.xxx.myds.me`）萬用字元憑證。Synology DDNS 網域在 DSM 申請 Let's Encrypt 時可勾選萬用字元，改走 DNS-01 驗證，**不需要對外開 80**；日後新增子網域也只要這一張。閘門與 `UPSTREAM_SERVER_NAME` 都能直接使用萬用字元憑證；萬用字元不涵蓋網域本身，用 `openssl x509 -in fullchain.pem -noout -ext subjectAltName` 確認同時列出 `your-domain` 與 `*.your-domain`。
 
 ## 運作細節
 

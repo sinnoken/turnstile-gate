@@ -1,7 +1,7 @@
 # turnstile-gate on MikroTik RouterOS v7 (e.g. RB5009 / arm64)
 # 說明文件：docs/deploy-mikrotik.md
 # 用法：先改下面的變數 → 上傳到路由器 → /import mikrotik-gate.rsc
-# 所有新增項目都有 comment 含 "gate"，方便日後查找/移除
+# 所有新增項目的 comment 或名稱都含 "gate"，方便日後查找/移除（script 以名稱 gate-blocklist 辨識）
 {
 :local nasIP   "192.168.88.10"      ;# NAS 的內網 IP
 :local domain  "nas.example.com"    ;# 你的網域；DSM 5001 的憑證必須是這個網域的
@@ -48,6 +48,10 @@
 /ip/firewall/filter/add place-before=$fTop chain=forward action=drop \
     src-address=172.17.0.0/24 connection-state=new \
     comment="gate: container isolation"
+# 封鎖清單 9090 只給路由器自己拉（路由器發出的是 output，不經 forward）；區網其他主機一律擋
+/ip/firewall/filter/add place-before=$fTop chain=forward action=drop \
+    dst-address=172.17.0.2 protocol=tcp dst-port=9090 \
+    comment="gate: blocklist router only"
 
 # ---------- 4. input：容器只能用路由器的 DNS，其他一律擋 ----------
 :local iTop [:pick [/ip/firewall/filter/find chain=input dynamic=no] 0]
@@ -55,6 +59,10 @@
     src-address=172.17.0.2 protocol=udp dst-port=53 comment="gate: DNS udp"
 /ip/firewall/filter/add place-before=$iTop chain=input action=accept \
     src-address=172.17.0.2 protocol=tcp dst-port=53 comment="gate: DNS tcp"
+# 路由器拉封鎖清單時，容器回的封包走 input；要排在下面那條 drop 之前
+/ip/firewall/filter/add place-before=$iTop chain=input action=accept \
+    src-address=172.17.0.2 protocol=tcp src-port=9090 \
+    connection-state=established,related comment="gate: blocklist replies"
 /ip/firewall/filter/add place-before=$iTop chain=input action=drop \
     src-address=172.17.0.0/24 comment="gate: no router access"
 
@@ -72,11 +80,36 @@
 /container/envs/add list=gate key=UPSTREAM          value="https://$nasIP:5001"
 /container/envs/add list=gate key=UPSTREAM_SERVER_NAME value=$domain
 /container/envs/add list=gate key=ALLOWED_HOSTS     value=$domain
+/container/envs/add list=gate key=BLOCKLIST_LISTEN  value="172.17.0.2:9090"
 # 憑證（/cert/fullchain.pem、/cert/privkey.pem）、GOMEMLIMIT=48MiB、SESSION_HOURS=12 都是映像的預設值
 /container/mounts/add list=gate-cert src="$disk/gate/cert" dst=/cert mode=ro
 /container/add remote-image=$image check-certificate=yes interface=veth-gate envlists=gate \
     mountlists=gate-cert root-dir="$disk/gate/root" dns=172.17.0.1 \
     logging=yes start-on-boot=yes comment="gate"
+
+# ---------- 7. 封鎖清單：每分鐘拉閘門的 /blocklist.json，寫進有時效的 address-list gate-block ----------
+# source={ } 是程式區塊，匯入時不展開 $ 變數，不需要跳脫；區塊內的變數都在區塊內宣告
+# 拉取或解析失敗只記一行 warning，既有項目照 timeout 到期，下一分鐘再試
+/system/script/add name=gate-blocklist source={
+    :onerror e in={
+        :local r [/tool/fetch url="http://172.17.0.2:9090/blocklist.json" output=user as-value]
+        :local j [:deserialize from=json value=($r->"data")]
+        :foreach it in=($j->"items") do={
+            :local ip ($it->"ip")
+            :local t [:totime (($it->"ttl") . "s")]
+            :local c ("gate: " . ($it->"event") . " #" . ($it->"strike"))
+            :local id [/ip/firewall/address-list/find list=gate-block address=$ip]
+            :if ([:len $id] = 0) do={
+                /ip/firewall/address-list/add list=gate-block address=$ip timeout=$t comment=$c
+            } else={
+                /ip/firewall/address-list/set $id timeout=$t comment=$c
+            }
+        }
+    } do={ :log warning "gate-blocklist: $e" }
+}
+/system/scheduler/add name=gate-blocklist interval=1m on-event=gate-blocklist comment="gate"
+/ip/firewall/raw/add chain=prerouting in-interface-list=WAN src-address-list=gate-block \
+    action=drop comment="gate: blocklist"
 
 :put "OK。等 /container/print 顯示 stopped（下載與解壓完成）後，且憑證已推送，再執行："
 :put "/container/start [find comment=\"gate\"]"

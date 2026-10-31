@@ -1,8 +1,10 @@
 // turnstile-gate: 單一執行檔的反向代理，前面加一道 Cloudflare Turnstile 驗證。
 // 通過驗證 → 發 HMAC 簽章 cookie → 之後的請求直接轉發到上游（例如 DSM）。
+// 確定不是真人的 IP（偽造 cookie、偽造或重複送 token）會被封鎖，清單可另開 listener 給路由器拉取。
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -13,13 +15,18 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,12 +54,20 @@ var (
 	insecure bool
 	// 以 IP 連上游、但憑證是網域的（例如 DSM 的 Let's Encrypt）時，設成該網域來驗證憑證；設定後忽略 UPSTREAM_INSECURE
 	serverName string
-	// 允許的網域，逗號分隔；設定後其他 Host（例如直接打 IP 的掃描器）一律 404
+	// 允許的網域，逗號分隔；設定後其他 Host 一律 421，HTTPS 時 SNI 不符的握手也直接中斷
 	allowedHosts []string
+	// 封鎖清單 JSON 的監聽位址（只放內部位址）；沒設就不啟用
+	blocklistListen string
+	logLevel        = new(slog.LevelVar)
 )
 
 func loadConfig() error {
 	var err error
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		if err := logLevel.UnmarshalText([]byte(v)); err != nil {
+			return fmt.Errorf("bad LOG_LEVEL %q", v)
+		}
+	}
 	if siteKey, err = needEnv("TURNSTILE_SITEKEY"); err != nil {
 		return err
 	}
@@ -79,15 +94,22 @@ func loadConfig() error {
 	insecure = os.Getenv("UPSTREAM_INSECURE") == "1"
 	serverName = os.Getenv("UPSTREAM_SERVER_NAME")
 	allowedHosts = splitList(os.Getenv("ALLOWED_HOSTS"))
+	blocklistListen = os.Getenv("BLOCKLIST_LISTEN")
 	return nil
 }
 
+func fatal(msg string, err error) {
+	slog.Error(msg, "err", err)
+	os.Exit(1)
+}
+
 func main() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 	if err := loadConfig(); err != nil {
-		log.Fatal(err)
+		fatal("config", err)
 	}
 	if insecure && serverName != "" {
-		log.Printf("UPSTREAM_SERVER_NAME=%s 已設定，忽略 UPSTREAM_INSECURE", serverName)
+		slog.Warn("UPSTREAM_SERVER_NAME 已設定，忽略 UPSTREAM_INSECURE", "server_name", serverName)
 	}
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -105,41 +127,56 @@ func main() {
 			stripGateCookie(r.Out)
 		},
 		Transport: &http.Transport{
+			DialContext:         (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout: 10 * time.Second,
 			TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecure && serverName == "", ServerName: serverName},
 			MaxIdleConnsPerHost: 32,
 		},
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /__gate", servePage)
-	mux.HandleFunc("GET /__gate/h.woff2", serveFont)
-	mux.HandleFunc("POST /__gate/verify", verify)
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if validCookie(r) || (hasPrefix(r.URL.Path, bypass) && !hasDotDot(r.URL.Path)) {
-			proxy.ServeHTTP(w, r)
-			return
-		}
-		// 非瀏覽器導覽（XHR、API）直接 401，避免 JSON 請求收到 HTML
-		if r.Method != http.MethodGet || !strings.Contains(r.Header.Get("Accept"), "text/html") {
-			http.Error(w, "verification required", http.StatusUnauthorized)
-			return
-		}
-		http.Redirect(w, r, "/__gate?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
-	})
-
-	srv := &http.Server{
-		Addr: listen,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !allowedHost(r.Host) {
-				http.NotFound(w, r)
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if errors.Is(err, context.Canceled) { // 用戶端自己中斷（關分頁、long-poll 被取消）
+				slog.Debug("upstream", "err", err, "path", r.URL.Path)
 				return
 			}
-			mux.ServeHTTP(w, r)
-		}),
+			slog.Error("upstream", "err", err, "path", r.URL.Path)
+			w.WriteHeader(http.StatusBadGateway)
+		},
+	}
+
+	srv := &http.Server{
+		Addr:              listen,
+		Handler:           newHandler(proxy),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
+		// TLS 握手失敗（含嚴格 SNI 擋下的）等雜訊只在 debug 出現
+		ErrorLog: log.New(serverLog{}, "", 0),
 	}
+	go blk.run()
+
+	ln, err := net.Listen("tcp", listen)
+	if err != nil {
+		fatal("listen", err)
+	}
+	// TRUST_CF_HEADER 時 RemoteAddr 是 Cloudflare 節點，不能在 listener 層封鎖，改由 handler 回 403
+	if !trustCF {
+		ln = blockListener{ln, blk}
+	}
+
+	var bsrv *http.Server
+	if blocklistListen != "" {
+		bl, err := net.Listen("tcp", blocklistListen)
+		if err != nil {
+			fatal("blocklist listen", err)
+		}
+		bsrv = &http.Server{Handler: http.HandlerFunc(serveBlocklist), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+		slog.Info("blocklist", "listen", blocklistListen)
+		go func() {
+			if err := bsrv.Serve(bl); err != http.ErrServerClosed {
+				fatal("blocklist serve", err)
+			}
+		}()
+	}
+
 	// 停止容器時會收到 SIGTERM。容器內的 PID 1 不會被訊號的預設動作終止，
 	// Go 最後只能以 exit status 2 結束，所以自己處理：等進行中的請求結束後正常退出
 	done := make(chan struct{})
@@ -149,28 +186,77 @@ func main() {
 		<-sig
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if bsrv != nil {
+			bsrv.Shutdown(ctx)
+		}
 		srv.Shutdown(ctx)
 		close(done)
 	}()
 
-	var err error
 	if certFile != "" && keyFile != "" {
 		cl := &certLoader{}
 		if _, err := cl.get(nil); err != nil {
-			log.Fatalf("load cert: %v", err)
+			fatal("load cert", err)
 		}
-		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: cl.get}
-		log.Printf("HTTPS on %s → %s", listen, upstream)
-		err = srv.ListenAndServeTLS("", "")
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: strictSNI(cl.get)}
+		slog.Info("start", "mode", "https", "listen", listen, "upstream", upstream.String())
+		err = srv.ServeTLS(ln, "", "")
 	} else {
-		log.Printf("HTTP on %s → %s (no cert configured)", listen, upstream)
-		err = srv.ListenAndServe()
+		slog.Info("start", "mode", "http", "listen", listen, "upstream", upstream.String(), "note", "no cert configured")
+		err = srv.Serve(ln)
 	}
 	if err != http.ErrServerClosed {
-		log.Fatal(err)
+		fatal("serve", err)
 	}
 	<-done
-	log.Printf("shutdown")
+	slog.Info("shutdown")
+}
+
+func newHandler(proxy http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /__gate", servePage)
+	mux.HandleFunc("GET /__gate/h.woff2", serveFont)
+	mux.HandleFunc("POST /__gate/verify", verify)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		st := cookieState(r)
+		if st == cookieValid || (hasPrefix(r.URL.Path, bypass) && !hasDotDot(r.URL.Path)) {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		switch st {
+		case cookieMalformed:
+			if report(r, clientIP(r), "bad_cookie", "", nil) {
+				w.Header().Set("Connection", "close")
+			}
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		case cookieBadSig, cookieExpired:
+			// 通常是換了 GATE_KEY 或過期：清掉讓使用者重新驗證，不算事件
+			http.SetCookie(w, gateCookie("", -1))
+		}
+		// 非瀏覽器導覽（XHR、API）直接 401，避免 JSON 請求收到 HTML
+		if r.Method != http.MethodGet || !strings.Contains(r.Header.Get("Accept"), "text/html") {
+			http.Error(w, "verification required", http.StatusUnauthorized)
+			return
+		}
+		http.Redirect(w, r, "/__gate?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		slog.Debug("request", "ip", ip, "method", r.Method, "host", r.Host, "path", r.URL.Path)
+		// 觸發封鎖的 keep-alive 連線、或 TRUST_CF_HEADER 時（listener 層不封）
+		if blk.blocked(ip) {
+			w.Header().Set("Connection", "close")
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+		if !allowedHost(r.Host) {
+			slog.Debug("misdirected", "ip", ip, "host", r.Host)
+			http.Error(w, "misdirected request", http.StatusMisdirectedRequest)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // ---------- 憑證：檔案有變動就重新載入（每分鐘最多檢查一次） ----------
@@ -202,14 +288,31 @@ func (c *certLoader) get(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	crt, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		if c.cert != nil {
-			log.Printf("reload cert failed, keep old: %v", err)
+			slog.Error("reload cert failed, keep old", "err", err)
 			return c.cert, nil
 		}
 		return nil, err
 	}
 	c.cert, c.mod = &crt, st.ModTime()
-	log.Printf("certificate loaded")
+	slog.Info("certificate loaded")
 	return c.cert, nil
+}
+
+var errSNI = errors.New("unknown server name")
+
+// 嚴格 SNI：設了 ALLOWED_HOSTS 時，SNI 不在清單（含用 IP 連線、沒有 SNI）就不送出憑證。不算事件
+func strictSNI(get func(*tls.ClientHelloInfo) (*tls.Certificate, error)) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		if len(allowedHosts) > 0 && !allowedHost(hi.ServerName) {
+			ip := ""
+			if hi.Conn != nil {
+				ip = addrIP(hi.Conn.RemoteAddr())
+			}
+			slog.Debug("sni rejected", "ip", ip, "sni", hi.ServerName)
+			return nil, errSNI
+		}
+		return get(hi)
+	}
 }
 
 // ---------- 驗證頁 ----------
@@ -274,7 +377,11 @@ func serveFont(w http.ResponseWriter, r *http.Request) {
 }
 
 func servePage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
+	h := w.Header()
+	h.Set("Cache-Control", "no-store")
+	h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "no-referrer")
 	page.Execute(w, map[string]any{
 		"SiteKey": siteKey,
 		"Next":    safeNext(r.URL.Query().Get("next")),
@@ -284,55 +391,77 @@ func servePage(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 驗證 token、發 cookie ----------
 
+// serverLog：http.Server 的錯誤日誌。TLS 握手失敗（掃描器、嚴格 SNI）是日常雜訊，記 debug；
+// 其他（panic、Accept 錯誤、HTTP/2 錯誤）記 error。
+type serverLog struct{}
+
+func (serverLog) Write(p []byte) (int, error) {
+	s := strings.TrimSpace(string(p))
+	if strings.HasPrefix(s, "http: TLS handshake error") {
+		slog.Debug(s)
+	} else {
+		slog.Error(s)
+	}
+	return len(p), nil
+}
+
 func verify(w http.ResponseWriter, r *http.Request) {
 	// Turnstile token 約 2 KB，表單不需要更大
-	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	if err := r.ParseForm(); err != nil {
+		// 沒讀完的 body（使用者中途離開、連線中斷）不能當成空 token，否則會誤封
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
 	}
 	next := safeNext(r.PostFormValue("next"))
 	token := r.PostFormValue("cf-turnstile-response")
 
 	ip := clientIP(r)
-	ok, err := siteverify(token, ip, r.Host)
-	if !ok {
-		// 一行記下 IP 與原因（Cloudflare 的 error-codes、連線錯誤或沒有 token），方便日後統計
-		reason := "empty token"
-		if err != nil {
-			reason = err.Error()
+	res := siteverify(token, ip, r.Host)
+	if !res.ok {
+		switch sig := res.signal(); {
+		case sig != "":
+			if report(r, ip, "verify_fail", sig, res.codes) {
+				w.Header().Set("Connection", "close")
+			}
+		case res.err != nil:
+			slog.Error("siteverify", "err", res.err, "ip", ip)
+		default:
+			slog.Error("siteverify", "errors", res.codes, "ip", ip)
 		}
-		log.Printf("verify failed ip=%s reason=%q", ip, reason)
 		http.Redirect(w, r, "/__gate?err=1&next="+url.QueryEscape(next), http.StatusSeeOther)
 		return
 	}
 
 	exp := strconv.FormatInt(time.Now().Add(ttl).Unix(), 10)
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    exp + "." + sign(exp),
-		Path:     "/",
-		MaxAge:   int(ttl.Seconds()),
-		Secure:   true,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
+	http.SetCookie(w, gateCookie(exp+"."+sign(exp), int(ttl.Seconds())))
 	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
-func siteverify(token, ip, host string) (bool, error) {
+var siteverifyURL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+
+// codes 是 Cloudflare 的 error-codes，另加閘門自己判斷的 empty-token、hostname-mismatch；err 是連線或解碼錯誤
+type svResult struct {
+	ok    bool
+	codes []string
+	err   error
+}
+
+func siteverify(token, ip, host string) svResult {
 	if token == "" {
-		return false, nil
+		return svResult{codes: []string{"empty-token"}}
 	}
 	c := http.Client{Timeout: 8 * time.Second}
-	resp, err := c.PostForm("https://challenges.cloudflare.com/turnstile/v0/siteverify", url.Values{
+	resp, err := c.PostForm(siteverifyURL, url.Values{
 		"secret": {secretKey}, "response": {token}, "remoteip": {ip},
 	})
 	if err != nil {
-		return false, err
+		return svResult{err: err}
 	}
 	defer resp.Body.Close()
 	var res struct {
@@ -340,17 +469,45 @@ func siteverify(token, ip, host string) (bool, error) {
 		Hostname string   `json:"hostname"`
 		Errors   []string `json:"error-codes"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return false, err
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&res); err != nil {
+		return svResult{err: err}
 	}
 	if !res.Success {
-		return false, fmt.Errorf("rejected: %v", res.Errors)
+		if len(res.Errors) == 0 {
+			res.Errors = []string{"unknown"}
+		}
+		return svResult{codes: res.Errors}
 	}
 	// token 必須是在本網域產生的
-	if res.Hostname != "" && !strings.EqualFold(res.Hostname, stripPort(host)) {
-		return false, fmt.Errorf("hostname mismatch: %s", res.Hostname)
+	if res.Hostname != "" && normHost(res.Hostname) != normHost(host) {
+		return svResult{codes: []string{"hostname-mismatch"}}
 	}
-	return true, nil
+	return svResult{ok: true}
+}
+
+// strong：立即封鎖；weak：10 分鐘內第 2 次才封鎖；""：閘門設定或 Cloudflare 的問題，不算事件
+func (s svResult) signal() string {
+	if s.ok || s.err != nil {
+		return ""
+	}
+	strong, weak := false, false
+	for _, c := range s.codes {
+		switch c {
+		case "missing-input-secret", "invalid-input-secret", "internal-error":
+			return ""
+		case "empty-token", "hostname-mismatch", "invalid-input-response", "bad-request":
+			strong = true
+		case "timeout-or-duplicate":
+			weak = true
+		}
+	}
+	switch {
+	case strong:
+		return "strong"
+	case weak:
+		return "weak"
+	}
+	return ""
 }
 
 // ---------- cookie ----------
@@ -361,17 +518,63 @@ func sign(v string) string {
 	return hex.EncodeToString(m.Sum(nil))
 }
 
-func validCookie(r *http.Request) bool {
-	c, err := r.Cookie(cookieName)
-	if err != nil {
-		return false
+func gateCookie(v string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     cookieName,
+		Value:    v,
+		Path:     "/",
+		MaxAge:   maxAge,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
 	}
-	exp, sig, ok := strings.Cut(c.Value, ".")
-	if !ok || !hmac.Equal([]byte(sig), []byte(sign(exp))) {
-		return false
+}
+
+// 數值越大越寬鬆；多個同名 cookie 取最大值
+type cookieStatus int
+
+const (
+	cookieNone cookieStatus = iota
+	cookieMalformed
+	cookieBadSig
+	cookieExpired
+	cookieValid
+)
+
+func (s cookieStatus) String() string {
+	return [...]string{"none", "malformed", "badsig", "expired", "valid"}[s]
+}
+
+// 日後改 cookie 格式時，舊格式必須判為 badsig（清除、不算事件），否則所有人都會被當成 malformed 封鎖
+func cookieState(r *http.Request) cookieStatus {
+	st := cookieNone
+	for _, c := range r.CookiesNamed(cookieName) {
+		if c.Value != "" {
+			st = max(st, parseCookie(c.Value))
+		}
+	}
+	return st
+}
+
+func parseCookie(v string) cookieStatus {
+	exp, sig, ok := strings.Cut(v, ".")
+	if !ok || len(sig) != 64 {
+		return cookieMalformed
 	}
 	t, err := strconv.ParseInt(exp, 10, 64)
-	return err == nil && time.Now().Unix() < t
+	if err != nil {
+		return cookieMalformed
+	}
+	if _, err := hex.DecodeString(sig); err != nil {
+		return cookieMalformed
+	}
+	if !hmac.Equal([]byte(sig), []byte(sign(exp))) {
+		return cookieBadSig
+	}
+	if time.Now().Unix() >= t {
+		return cookieExpired
+	}
+	return cookieValid
 }
 
 // 不把閘門 cookie 傳給上游
@@ -383,6 +586,270 @@ func stripGateCookie(r *http.Request) {
 			r.AddCookie(c)
 		}
 	}
+}
+
+// ---------- 封鎖 ----------
+
+const (
+	tableMax     = 50000
+	weakWindow   = 10 * time.Minute
+	strikeWindow = 7 * 24 * time.Hour
+	sweepEvery   = 10 * time.Minute
+	// RouterOS /tool/fetch output=user 讀回上限約 64 KB；每筆最長約 72 bytes，800 筆約 58 KB
+	blocklistMax = 800
+)
+
+type offender struct {
+	until    time.Time // 封鎖到期；零值 = 未封鎖
+	strikes  int       // 7 天內被封鎖的次數
+	lastHit  time.Time // 最後一次被封鎖（判斷 7 天視窗）
+	failedAt time.Time // 最後一次 verify_fail（判斷 10 分鐘視窗）
+	event    string    // 最後一次封鎖的事件，給封鎖清單
+}
+
+type blocker struct {
+	mu       sync.Mutex
+	m        map[string]*offender // key = IP 字串
+	max      int
+	now      func() time.Time
+	fullTill time.Time // 表滿且全部在封鎖中：最早解封前不再掃描
+}
+
+var blk = newBlocker()
+
+func newBlocker() *blocker {
+	return &blocker{m: map[string]*offender{}, max: tableMax, now: time.Now}
+}
+
+func blockKey(ip string) (string, bool) {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return "", false
+	}
+	return a.Unmap().String(), true
+}
+
+func (b *blocker) blocked(ip string) bool {
+	k, ok := blockKey(ip)
+	if !ok {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	o := b.m[k]
+	return o != nil && o.until.After(b.now())
+}
+
+// 事件日誌由呼叫端記錄；回傳 true 表示此 IP 現在封鎖中
+func (b *blocker) hit(ip, event, signal string) bool {
+	a, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	a = a.Unmap()
+	if a.IsPrivate() || a.IsLoopback() || a.IsLinkLocalUnicast() {
+		return false
+	}
+	k := a.String()
+	now := b.now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	o := b.m[k]
+	if o == nil {
+		if len(b.m) >= b.max {
+			if now.Before(b.fullTill) {
+				return false
+			}
+			if !b.evict(now) {
+				slog.Warn("table full", "ip", k, "entries", len(b.m), "until", b.fullTill)
+				return false
+			}
+		}
+		o = &offender{}
+		b.m[k] = o
+	}
+	// 同時多條連線觸發時不重複加重
+	if o.until.After(now) {
+		return true
+	}
+	if event == "verify_fail" {
+		prev := o.failedAt
+		o.failedAt = now
+		if signal == "weak" && (prev.IsZero() || now.Sub(prev) > weakWindow) {
+			return false
+		}
+	}
+	if !o.lastHit.IsZero() && now.Sub(o.lastHit) > strikeWindow {
+		o.strikes = 0
+	}
+	o.strikes++
+	o.lastHit = now
+	d := blockFor(o.strikes)
+	o.until, o.event = now.Add(d), event
+	attrs := []any{"ip", k, "event", event}
+	if signal != "" {
+		attrs = append(attrs, "signal", signal)
+	}
+	slog.Warn("blocked", append(attrs, "strike", o.strikes, "duration", d.String())...)
+	return true
+}
+
+func blockFor(strikes int) time.Duration {
+	switch strikes {
+	case 1:
+		return time.Hour
+	case 2:
+		return 24 * time.Hour
+	}
+	return 7 * 24 * time.Hour
+}
+
+// 表滿：刪一筆沒在封鎖、lastHit 最舊的項目；全部都在封鎖中就回 false。呼叫端持有鎖
+func (b *blocker) evict(now time.Time) bool {
+	var victim string
+	var oldest, soonest time.Time
+	for k, o := range b.m {
+		if o.until.After(now) {
+			if soonest.IsZero() || o.until.Before(soonest) {
+				soonest = o.until
+			}
+			continue
+		}
+		if victim == "" || o.lastHit.Before(oldest) {
+			victim, oldest = k, o.lastHit
+		}
+	}
+	if victim == "" {
+		b.fullTill = soonest
+		return false
+	}
+	delete(b.m, victim)
+	return true
+}
+
+// 刪除封鎖、累犯、verify_fail 紀錄都已過期的項目；回傳剩餘筆數與封鎖中筆數
+func (b *blocker) sweep() (entries, blocked int) {
+	now := b.now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k, o := range b.m {
+		if !o.until.After(now) && now.Sub(o.lastHit) >= strikeWindow && now.Sub(o.failedAt) >= weakWindow {
+			delete(b.m, k)
+			continue
+		}
+		if o.until.After(now) {
+			blocked++
+		}
+	}
+	return len(b.m), blocked
+}
+
+func (b *blocker) run() {
+	t := time.NewTicker(sweepEvery)
+	for i := 1; ; i++ {
+		<-t.C
+		n, nb := b.sweep()
+		if i%int(time.Hour/sweepEvery) == 0 {
+			slog.Info("table", "entries", n, "blocked", nb)
+		}
+	}
+}
+
+type entry struct {
+	IP     string `json:"ip"`
+	TTL    int    `json:"ttl"`
+	Event  string `json:"event"`
+	Strike int    `json:"strike"`
+}
+
+// 目前封鎖中的 IPv4 與剩餘秒數（無條件進位）
+func (b *blocker) list() []entry {
+	now := b.now()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := []entry{}
+	for k, o := range b.m {
+		if !o.until.After(now) {
+			continue
+		}
+		if a, err := netip.ParseAddr(k); err != nil || !a.Is4() {
+			continue
+		}
+		left := o.until.Sub(now)
+		out = append(out, entry{k, int((left + time.Second - 1) / time.Second), o.event, o.strikes})
+	}
+	return out
+}
+
+// 記錄事件並交給封鎖表；回傳 true 表示此 IP 現在封鎖中
+func report(r *http.Request, ip, event, signal string, codes []string) bool {
+	ua := r.UserAgent()
+	if len(ua) > 256 {
+		ua = ua[:256]
+	}
+	attrs := []any{"event", event}
+	if signal != "" {
+		attrs = append(attrs, "signal", signal)
+	}
+	attrs = append(attrs, "ip", ip, "host", r.Host, "ua", ua)
+	if codes != nil {
+		attrs = append(attrs, "errors", codes)
+	}
+	slog.Info("event", attrs...)
+	return blk.hit(ip, event, signal)
+}
+
+type blockListener struct {
+	net.Listener
+	b *blocker
+}
+
+// 封鎖中的來源在 TLS 握手前直接關閉
+func (l blockListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if ip := addrIP(c.RemoteAddr()); ip != "" && l.b.blocked(ip) {
+			slog.Debug("dropped", "ip", ip)
+			c.Close()
+			continue
+		}
+		return c, nil
+	}
+}
+
+func addrIP(a net.Addr) string {
+	ap, err := netip.ParseAddrPort(a.String())
+	if err != nil {
+		return ""
+	}
+	return ap.Addr().Unmap().String()
+}
+
+func serveBlocklist(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/blocklist.json" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	items := blk.list()
+	slices.SortFunc(items, func(a, b entry) int { return cmp.Compare(b.TTL, a.TTL) })
+	if len(items) > blocklistMax {
+		slog.Warn("blocklist truncated", "items", len(items), "max", blocklistMax)
+		items = items[:blocklistMax]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(struct {
+		Generated string  `json:"generated"`
+		Items     []entry `json:"items"`
+	}{blk.now().UTC().Format(time.RFC3339), items})
 }
 
 // ---------- 小工具 ----------
@@ -459,18 +926,23 @@ func certPaths() (string, string) {
 	return dc, dk
 }
 
-// 沒設 ALLOWED_HOSTS 時不檢查；比對時去掉 port、不分大小寫
+// 沒設 ALLOWED_HOSTS 時不檢查（Host 與 SNI 共用）
 func allowedHost(h string) bool {
 	if len(allowedHosts) == 0 {
 		return true
 	}
-	h = stripPort(h)
+	h = normHost(h)
 	for _, a := range allowedHosts {
-		if strings.EqualFold(h, a) {
+		if h == normHost(a) {
 			return true
 		}
 	}
 	return false
+}
+
+// 去掉 port 與結尾的 .（ninja.example.me. 是合法寫法），轉小寫
+func normHost(h string) string {
+	return strings.ToLower(strings.TrimSuffix(stripPort(h), "."))
 }
 
 func stripPort(h string) string {
