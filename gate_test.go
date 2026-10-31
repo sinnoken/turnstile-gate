@@ -5,6 +5,9 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"log/slog"
 	"net"
@@ -12,6 +15,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -704,5 +709,134 @@ func TestServeFont(t *testing.T) {
 	}
 	if len(headingFont) == 0 || !bytes.Equal(rec.Body.Bytes(), headingFont) {
 		t.Error("body differs from embedded font")
+	}
+}
+
+// main.go 讀取的環境變數名稱：os.Getenv 與包裝它的函式（第一個參數直接傳給 os.Getenv）的字串常數第一引數
+func codeEnvVars(t *testing.T, src []byte) (names map[string]bool, helpers []string) {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), "main.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	isGetenv := func(c *ast.CallExpr) bool {
+		sel, ok := c.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Getenv" {
+			return false
+		}
+		id, ok := sel.X.(*ast.Ident)
+		return ok && id.Name == "os"
+	}
+	wrap := map[string]bool{}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Recv != nil || len(fd.Type.Params.List) == 0 || len(fd.Type.Params.List[0].Names) == 0 {
+			continue
+		}
+		p := fd.Type.Params.List[0].Names[0].Name
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if c, ok := n.(*ast.CallExpr); ok && isGetenv(c) && len(c.Args) == 1 {
+				if id, ok := c.Args[0].(*ast.Ident); ok && id.Name == p {
+					wrap[fd.Name.Name] = true
+				}
+			}
+			return true
+		})
+	}
+	for h := range wrap {
+		helpers = append(helpers, h)
+	}
+	sort.Strings(helpers)
+	names = map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		c, ok := n.(*ast.CallExpr)
+		if !ok || len(c.Args) == 0 {
+			return true
+		}
+		id, isIdent := c.Fun.(*ast.Ident)
+		if !isGetenv(c) && !(isIdent && wrap[id.Name]) {
+			return true
+		}
+		if lit, ok := c.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+			if s, err := strconv.Unquote(lit.Value); err == nil {
+				names[s] = true
+			}
+		}
+		return true
+	})
+	return names, helpers
+}
+
+// README「## 設定」表格（到下一個標題為止）第一欄的變數名稱
+func readmeEnvVars(readme string) map[string]bool {
+	names := map[string]bool{}
+	in := false
+	nameRe := regexp.MustCompile("`([A-Z][A-Z0-9_]*)`")
+	for _, line := range strings.Split(strings.ReplaceAll(readme, "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(line, "#") {
+			in = strings.TrimSpace(line) == "## 設定"
+			continue
+		}
+		if !in || !strings.HasPrefix(line, "| `") {
+			continue
+		}
+		cell := strings.SplitN(line[1:], "|", 2)[0]
+		for _, m := range nameRe.FindAllStringSubmatch(cell, -1) {
+			names[m[1]] = true
+		}
+	}
+	return names
+}
+
+// 兩邊的差異：程式有讀但 README 沒寫、README 有寫但程式沒讀
+func envVarDrift(code, doc map[string]bool) (missing, extra []string) {
+	// 不是 main.go 讀的、由 Go runtime 讀取的變數
+	runtimeVars := map[string]bool{"GOMEMLIMIT": true}
+	for k := range code {
+		if !doc[k] {
+			missing = append(missing, k)
+		}
+	}
+	for k := range doc {
+		if !code[k] && !runtimeVars[k] {
+			extra = append(extra, k)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	return
+}
+
+func TestReadmeEnvVars(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, helpers := codeEnvVars(t, src)
+	doc := readmeEnvVars(string(readme))
+	if len(code) == 0 || len(doc) == 0 {
+		t.Fatalf("解析不到變數：code=%v doc=%v", code, doc)
+	}
+	t.Logf("helpers=%v code=%d doc=%d", helpers, len(code), len(doc))
+	missing, extra := envVarDrift(code, doc)
+	if len(missing) > 0 {
+		t.Errorf("main.go 有讀但 README 設定表沒列：%v", missing)
+	}
+	if len(extra) > 0 {
+		t.Errorf("README 設定表有列但 main.go 沒讀：%v", extra)
+	}
+
+	// 確認比對真的抓得到差異：把一列改名
+	renamed := strings.Replace(string(readme), "| `LISTEN` |", "| `LISTEN_ADDR` |", 1)
+	if renamed == string(readme) {
+		t.Fatal("README 找不到 LISTEN 列")
+	}
+	missing, extra = envVarDrift(code, readmeEnvVars(renamed))
+	if fmt.Sprint(missing, extra) != "[LISTEN] [LISTEN_ADDR]" {
+		t.Errorf("改名後 missing=%v extra=%v", missing, extra)
 	}
 }
