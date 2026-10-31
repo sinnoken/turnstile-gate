@@ -4,3 +4,4 @@
 cert/
 deploy/cert/
 id_gate*
+*.exe
