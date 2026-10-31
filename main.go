@@ -595,8 +595,10 @@ const (
 	weakWindow   = 10 * time.Minute
 	strikeWindow = 7 * 24 * time.Hour
 	sweepEvery   = 10 * time.Minute
-	// RouterOS /tool/fetch output=user 讀回上限約 64 KB；每筆最長約 72 bytes，800 筆約 58 KB
-	blocklistMax = 800
+	// RouterOS /tool/fetch output=user 讀回上限 64512 bytes。最長一筆是 IPv6 前綴
+	// （ffff:ffff:ffff:ffff::/64、verify_fail、ttl 6 位、strike 3 位）含逗號 82 bytes，
+	// 700 筆約 57.5 KB；strike 到 10 位數也仍在上限內
+	blocklistMax = 700
 )
 
 type offender struct {
@@ -609,7 +611,7 @@ type offender struct {
 
 type blocker struct {
 	mu       sync.Mutex
-	m        map[string]*offender // key = IP 字串
+	m        map[string]*offender // key = blockKey
 	max      int
 	now      func() time.Time
 	fullTill time.Time // 表滿且全部在封鎖中：最早解封前不再掃描
@@ -621,12 +623,22 @@ func newBlocker() *blocker {
 	return &blocker{m: map[string]*offender{}, max: tableMax, now: time.Now}
 }
 
+// 封鎖鍵：IPv4 為單一位址；IPv6 為 /64 前綴（同一用戶端可在 /64 內任意換位址）。
+// 私有、loopback、link-local（含 fc00::/7、fe80::/10、::1 與 IPv4-mapped 的私有 IPv4）一律不封，回傳 false
 func blockKey(ip string) (string, bool) {
 	a, err := netip.ParseAddr(ip)
 	if err != nil {
 		return "", false
 	}
-	return a.Unmap().String(), true
+	a = a.Unmap()
+	if a.IsPrivate() || a.IsLoopback() || a.IsLinkLocalUnicast() {
+		return "", false
+	}
+	if a.Is4() {
+		return a.String(), true
+	}
+	p, _ := a.Prefix(64)
+	return p.String(), true
 }
 
 func (b *blocker) blocked(ip string) bool {
@@ -642,15 +654,10 @@ func (b *blocker) blocked(ip string) bool {
 
 // 事件日誌由呼叫端記錄；回傳 true 表示此 IP 現在封鎖中
 func (b *blocker) hit(ip, event, signal string) bool {
-	a, err := netip.ParseAddr(ip)
-	if err != nil {
+	k, ok := blockKey(ip)
+	if !ok {
 		return false
 	}
-	a = a.Unmap()
-	if a.IsPrivate() || a.IsLoopback() || a.IsLinkLocalUnicast() {
-		return false
-	}
-	k := a.String()
 	now := b.now()
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -762,7 +769,7 @@ type entry struct {
 	Strike int    `json:"strike"`
 }
 
-// 目前封鎖中的 IPv4 與剩餘秒數（無條件進位）
+// 目前封鎖中的 IPv4 位址、IPv6 /64 前綴與剩餘秒數（無條件進位）
 func (b *blocker) list() []entry {
 	now := b.now()
 	b.mu.Lock()
@@ -770,9 +777,6 @@ func (b *blocker) list() []entry {
 	out := []entry{}
 	for k, o := range b.m {
 		if !o.until.After(now) {
-			continue
-		}
-		if a, err := netip.ParseAddr(k); err != nil || !a.Is4() {
 			continue
 		}
 		left := o.until.Sub(now)

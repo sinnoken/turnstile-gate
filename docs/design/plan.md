@@ -7,9 +7,10 @@
 | 項目 | 內容 | 章節 |
 |---|---|---|
 | 路由器端驗收 | 在 RB5009 上確認封鎖清單（B）與部署設定 | §3 |
-| 上線後檢視 | 依正式環境的日誌決定要不要調整封鎖機制 | §4 |
-| 條件觸發的項目 | 部署情況或 CI 改變時才做 | §5 |
-| 選做 | cookie 自動續簽、Spamhaus DROP、誘餌登入頁 | §6 |
+| IPv6 | IPv6 用戶端經閘門連到 DSM，封鎖機制對 IPv6 同樣有效 | §4 |
+| 上線後檢視 | 依正式環境的日誌決定要不要調整封鎖機制 | §5 |
+| 條件觸發的項目 | 部署情況或 CI 改變時才做 | §6 |
+| 選做 | cookie 自動續簽、Spamhaus DROP、誘餌登入頁 | §7 |
 
 ---
 
@@ -45,7 +46,6 @@
 - 不要把 DSM 的 80、5000、5001 直接轉發到外部，會繞過閘門。
 - 不要在直接對外時預設開啟 `TRUST_CF_HEADER`，會讓攻擊者偽造來源 IP。
 - 不要引入第三方 Go 套件；維持標準函式庫、單一 `main.go`、單一執行檔（CI 工具如 `govulncheck` 不算相依套件）。
-- 不要為 IPv6 加任何機制。
 - 不要改 cookie 格式而不保留過渡期：舊格式必須判為 `badsig`（清除、不算事件），至少保留一個 `SESSION_HOURS`，否則所有人的舊 cookie 都會被當成 `malformed` 而集體封鎖。
 
 ## 3. 路由器端驗收
@@ -76,7 +76,7 @@
 |:-:|---|
 | 1 | DSM 憑證是 `*.ninja218j.myds.me` 萬用字元憑證並列出網域本身；走 DNS-01，不對外開 80 |
 | 2 | DSM 排程以 root 每天執行 `dsm-push-cert.sh`，只在異常終止時寄信 |
-| 3 | DSM 把 `172.17.0.2` 加進受信任的 Proxy；QuickConnect、UPnP 關閉；Synology DDNS 不開 IPv6 自動更新 |
+| 3 | DSM 把 `172.17.0.2` 加進受信任的 Proxy；QuickConnect、UPnP 關閉；Synology DDNS 不更新 AAAA（AAAA 指向路由器，見 §4） |
 | 4 | RB5009 的 WireGuard 可連回家；手機 App（DS File、Photos）走這條 |
 | 5 | 外部監控（UptimeRobot 等）檢查 `https://<網域>/__gate` 可連與憑證到期 |
 | 6 | Split DNS：`/ip/dns/static` 有 `<網域>` → NAS IP |
@@ -85,7 +85,40 @@
 
 驗收：以上全部確認；結果與文件不符的地方改文件或 `deploy/`。
 
-## 4. 上線後檢視
+## 4. IPv6
+
+IPv6 用戶端經閘門連到 DSM；封鎖、封鎖清單與路由器端丟棄對 IPv6 同樣有效。DSM 本身不對外開放 IPv6 入站。
+
+### 4.1 路由器網路
+
+比照 IPv4：容器用內部位址，WAN 以 dst-nat 轉進來。
+
+- `br-ct` 加 ULA `fd17::1/64`；`veth-gate` 的 `address` 加 `fd17::2/64`、`gateway6=fd17::1`。
+- `/ipv6/firewall/nat`：WAN tcp 443 → `dst-nat to-address=fd17::2 to-ports=8443`。
+- `/ipv6/firewall/filter` forward：只允許到 `[fd17::2]:8443` 的新連線（速率限制同 IPv4）；容器的 IPv6 出站只開外網 443（siteverify）。外網直連 NAS 由路由器自己的 IPv6 防火牆擋（出廠預設已擋），設定檔不另加規則。
+- DNS：網域的 AAAA 指向路由器 WAN 的 IPv6 位址；Synology DDNS 不更新 AAAA（指向 NAS 會繞過閘門）。
+
+### 4.2 閘門
+
+- 封鎖鍵：IPv4 為單一位址；IPv6 為 `/64` 前綴（同一用戶端可在 `/64` 內任意換位址）。`blockListener`、handler、`/blocklist.json` 共用同一個鍵函式。
+- 私有位址不封：`fc00::/7`、`fe80::/10`、`::1` 與 IPv4-mapped 的私有 IPv4。
+- `/blocklist.json` 輸出 IPv6 項目，`ip` 欄位為前綴（例：`2001:db8:1:2::/64`）。`blocklistMax` 依最長的 IPv6 項目重算，整份 JSON 仍須小於 RouterOS `/tool/fetch` 的 64512 bytes。
+
+### 4.3 路由器 script
+
+- `gate-blocklist` 依 `ip` 是否含 `:` 寫入 `/ip/firewall/address-list` 或 `/ipv6/firewall/address-list` 的 `gate-block`（`timeout` 同 IPv4）。
+- `/ipv6/firewall/raw` prerouting：`in-interface-list=WAN src-address-list=gate-block action=drop`。
+
+### 4.4 文件
+
+`docs/blocking.md`（封鎖鍵、清單格式）、`docs/deploy-mikrotik.md`（IPv6 網路、已部署路由器的升級步驟、移除步驟）、`deploy/mikrotik-gate.rsc`、README 設定範例。RouterOS 指令寫之前對照 7.24 手冊。
+
+### 4.5 驗收
+
+- 單元測試：IPv6 封鎖鍵為 `/64`；同 `/64` 另一位址視為已封鎖；ULA、link-local 不封；JSON 含 IPv6 前綴且 IPv4 輸出不變；最長項目 × `blocklistMax` 小於 64512。
+- 路由器：從外部 IPv6 開驗證頁、通過並登入 DSM，DSM 看到的 `X-Real-IP` 是用戶端 IPv6；以 IPv6 送 `Cookie: __gate=x` 後，該 `/64` 出現在 `/ipv6/firewall/address-list` 並在 raw 被丟棄；從外部 IPv6 直接連 NAS 失敗；IPv4 的 §3 驗收仍通過。
+
+## 5. 上線後檢視
 
 以預設 `LOG_LEVEL=info` 跑兩週後，從 `/log` 統計 `event`、`blocked`、`table` 日誌（查詢方式見 [docs/blocking.md](../blocking.md)「查詢誰被封鎖」），逐項決定：
 
@@ -97,11 +130,10 @@
 | B 的延遲 | 被封鎖 IP 在第一分鐘的 `dropped`（需短暫開 `debug`） | 造成負擔才縮短拉取間隔 |
 | 累犯紀錄被清空 | 閘門重啟頻率 | 升級頻繁、累犯常被清空時，把封鎖表定期寫到掛載的磁碟 |
 | 慢速掃描器 | 未封鎖但反覆出現的來源 | 先有日誌證明不會誤封，才評估低權重事件 |
-| IPv6 | IPv6 來源的事件比例 | 明顯增加時，封鎖鍵改成 IPv6 `/64` 前綴 |
 
 驗收：每一項有結論（維持或改），要改的寫成本文件的新項目。
 
-## 5. 條件觸發的項目
+## 6. 條件觸發的項目
 
 | 條件 | 做法 |
 |---|---|
@@ -113,7 +145,7 @@
 | `ubuntu-latest` 換到新版後 CI 出問題 | `runs-on` 固定為 `ubuntu-24.04` |
 | 新版 govulncheck 本身出錯 | 暫時改回 `go install golang.org/x/vuln/cmd/govulncheck@<已知可用且支援目前 Go 的版本>` |
 
-## 6. 選做（低優先）
+## 7. 選做（低優先）
 
 | 項目 | 做法 | 驗收條件 |
 |---|---|---|
@@ -121,7 +153,7 @@
 | Spamhaus DROP | 路由器排程定期拉 DROP 清單寫進有時效的 address-list，raw prerouting 丟棄；閘門不參與 | 清單中的 IP 從 WAN 在 raw 被丟棄；拉取失敗時既有項目照時效到期 |
 | 誘餌登入頁 | 見 [decoy.md](decoy.md) | 見 decoy.md §5 |
 
-## 7. 開發與驗證
+## 8. 開發與驗證
 
 ```bash
 gofmt -l . && go vet ./...

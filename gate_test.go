@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -357,7 +358,7 @@ func TestBlockerWeak(t *testing.T) {
 
 func TestBlockerPrivate(t *testing.T) {
 	freshBlocker(t)
-	for _, ip := range []string{"10.1.2.3", "172.17.0.1", "192.168.1.5", "127.0.0.1", "169.254.1.1", "::1", "fe80::1", "fd00::1", "::ffff:192.168.1.5", "not-an-ip", ""} {
+	for _, ip := range []string{"10.1.2.3", "172.17.0.1", "192.168.1.5", "127.0.0.1", "169.254.1.1", "::1", "fe80::1", "fe80::1%eth0", "fd00::1", "fc00::1", "fd17::2", "::ffff:192.168.1.5", "::ffff:127.0.0.1", "not-an-ip", ""} {
 		if blk.hit(ip, "bad_cookie", "") || blk.blocked(ip) {
 			t.Errorf("%q blocked", ip)
 		}
@@ -420,63 +421,72 @@ func TestBlockerSweep(t *testing.T) {
 	}
 }
 
+// 假的 listener：依序交出指定來源位址的連線（不需要真的 IPv6 網路）
+type fakeListener struct {
+	net.Listener
+	conns chan net.Conn
+}
+
+func (l fakeListener) Accept() (net.Conn, error) {
+	c, ok := <-l.conns
+	if !ok {
+		return nil, net.ErrClosed
+	}
+	return c, nil
+}
+
+type addrConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c addrConn) RemoteAddr() net.Addr { return c.remote }
+
 func TestBlockListener(t *testing.T) {
 	freshBlocker(t)
-	blk.now = time.Now
-	raw, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	ln := blockListener{raw, blk}
-	// loopback 不會經由 hit 封鎖，測試直接寫入表格
-	blk.m["127.0.0.1"] = &offender{until: time.Now().Add(time.Hour)}
+	blk.hit("203.0.113.9", "bad_cookie", "")
+	blk.hit("2001:db8:1:2::5", "bad_cookie", "")
 
-	got := make(chan net.Conn, 1)
-	go func() {
-		c, err := ln.Accept()
-		if err == nil {
-			got <- c
+	fl := fakeListener{conns: make(chan net.Conn, 8)}
+	ln := blockListener{fl, blk}
+	var clients []net.Conn
+	feed := func(addr string) {
+		s, c := net.Pipe()
+		clients = append(clients, c)
+		fl.conns <- addrConn{s, net.TCPAddrFromAddrPort(netip.MustParseAddrPort(addr))}
+	}
+	feed("203.0.113.9:1000")
+	feed("[2001:db8:1:2:ffff::1]:1000") // 同一個 /64 的另一個位址
+	feed("[::ffff:203.0.113.9]:1000")
+	feed("[2001:db8:1:3::5]:1000")
+	feed("[fd17::1]:1000")
+	feed("203.0.113.10:1000")
+	close(fl.conns)
+	defer func() {
+		for _, c := range clients {
+			c.Close()
 		}
 	}()
 
-	c1, err := net.Dial("tcp", raw.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c1.Close()
-	c1.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := c1.Read(make([]byte, 1)); err == nil || isTimeout(err) {
-		t.Fatalf("blocked conn not closed: %v", err)
-	}
-	select {
-	case <-got:
-		t.Fatal("blocked conn returned from Accept")
-	default:
-	}
-
-	blk.mu.Lock()
-	delete(blk.m, "127.0.0.1")
-	blk.mu.Unlock()
-	c2, err := net.Dial("tcp", raw.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c2.Close()
-	select {
-	case c := <-got:
-		if c.RemoteAddr().String() != c2.LocalAddr().String() {
-			t.Errorf("accepted %v, want %v", c.RemoteAddr(), c2.LocalAddr())
+	for i, want := range []string{"[2001:db8:1:3::5]:1000", "[fd17::1]:1000", "203.0.113.10:1000"} {
+		c, err := ln.Accept()
+		if err != nil {
+			t.Fatalf("accept %d: %v", i, err)
 		}
-		c.Close()
-	case <-time.After(2 * time.Second):
-		t.Fatal("unblocked conn not accepted")
+		if got := c.RemoteAddr().String(); got != want {
+			t.Errorf("accepted %s, want %s", got, want)
+		}
 	}
-}
-
-func isTimeout(err error) bool {
-	ne, ok := err.(net.Error)
-	return ok && ne.Timeout()
+	if _, err := ln.Accept(); err == nil {
+		t.Error("extra conn accepted")
+	}
+	// 被擋的連線已關閉
+	for _, c := range clients[:3] {
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+			t.Errorf("blocked conn not closed: %v", err)
+		}
+	}
 }
 
 func TestHandler(t *testing.T) {
@@ -579,13 +589,17 @@ func TestTrustCFBlocked(t *testing.T) {
 	defer func(old bool) { trustCF = old }(trustCF)
 	trustCF = true
 	blk.hit("203.0.113.8", "bad_cookie", "")
+	blk.hit("2001:db8:9:9::1", "bad_cookie", "")
 	h := newHandler(http.NotFoundHandler())
-	r := httptest.NewRequest("GET", "/", nil)
-	r.Header.Set("CF-Connecting-IP", "203.0.113.8")
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, r)
-	if rec.Code != http.StatusForbidden || rec.Header().Get("Connection") != "close" {
-		t.Errorf("got %d %q", rec.Code, rec.Header().Get("Connection"))
+	// IPv6 以 /64 判斷：同前綴的另一個位址也擋
+	for _, ip := range []string{"203.0.113.8", "2001:db8:9:9::abcd"} {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set("CF-Connecting-IP", ip)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		if rec.Code != http.StatusForbidden || rec.Header().Get("Connection") != "close" {
+			t.Errorf("%s: got %d %q", ip, rec.Code, rec.Header().Get("Connection"))
+		}
 	}
 }
 
@@ -618,8 +632,9 @@ func TestBlocklist(t *testing.T) {
 		t.Errorf("generated %q", out.Generated)
 	}
 	want := map[string]entry{
-		"203.0.113.50": {"203.0.113.50", 3540, "bad_cookie", 1},
-		"198.51.100.7": {"198.51.100.7", 3540, "verify_fail", 1},
+		"203.0.113.50":  {"203.0.113.50", 3540, "bad_cookie", 1},
+		"198.51.100.7":  {"198.51.100.7", 3540, "verify_fail", 1},
+		"2001:db8::/64": {"2001:db8::/64", 3540, "bad_cookie", 1},
 	}
 	if len(out.Items) != len(want) {
 		t.Fatalf("items %+v", out.Items)
@@ -627,6 +642,11 @@ func TestBlocklist(t *testing.T) {
 	for _, it := range out.Items {
 		if want[it.IP] != it {
 			t.Errorf("item %+v", it)
+		}
+	}
+	for _, w := range []string{`{"ip":"203.0.113.50","ttl":3540,"event":"bad_cookie","strike":1}`, `{"ip":"2001:db8::/64","ttl":3540,"event":"bad_cookie","strike":1}`} {
+		if !strings.Contains(rec.Body.String(), w) {
+			t.Errorf("body missing %s: %s", w, rec.Body.String())
 		}
 	}
 
@@ -666,6 +686,108 @@ func TestBlocklistTruncate(t *testing.T) {
 	if out.Items[0].TTL != blocklistMax+5 || out.Items[len(out.Items)-1].TTL != 6 {
 		t.Errorf("not longest ttl first: %d..%d", out.Items[0].TTL, out.Items[len(out.Items)-1].TTL)
 	}
+}
+
+func TestBlockKey(t *testing.T) {
+	for ip, want := range map[string]string{
+		"203.0.113.5":             "203.0.113.5",
+		"::ffff:203.0.113.5":      "203.0.113.5",
+		"2001:db8:1:2:3:4:5:6":    "2001:db8:1:2::/64",
+		"2001:DB8:1:2::1":         "2001:db8:1:2::/64",
+		"2001:db8:1:2::1%eth0":    "2001:db8:1:2::/64",
+		"2001:db8::1":             "2001:db8::/64",
+		"ffff:ffff:ffff:ffff:1::": "ffff:ffff:ffff:ffff::/64",
+	} {
+		if got, ok := blockKey(ip); !ok || got != want {
+			t.Errorf("blockKey(%q) = %q, %v; want %q", ip, got, ok, want)
+		}
+	}
+	for _, ip := range []string{"192.168.1.5", "::ffff:10.0.0.1", "::1", "fc00::1", "fdff::1", "fe80::1", "febf::1", "x", ""} {
+		if k, ok := blockKey(ip); ok {
+			t.Errorf("blockKey(%q) = %q, want never blocked", ip, k)
+		}
+	}
+}
+
+func TestBlockerIPv6(t *testing.T) {
+	freshBlocker(t)
+	if !blk.hit("2001:db8:1:2::5", "bad_cookie", "") {
+		t.Fatal("not blocked")
+	}
+	if !blk.blocked("2001:db8:1:2:abcd:ef01:2345:6789") {
+		t.Error("same /64 not blocked")
+	}
+	if blk.blocked("2001:db8:1:3::5") || blk.blocked("2001:db8:1::5") {
+		t.Error("other /64 blocked")
+	}
+	// 同一個 /64 換位址再觸發：已在封鎖中，不加重
+	blk.hit("2001:db8:1:2::6", "bad_cookie", "")
+	if o := blk.m["2001:db8:1:2::/64"]; len(blk.m) != 1 || o == nil || o.strikes != 1 {
+		t.Errorf("table %v", blk.m)
+	}
+}
+
+func TestHandlerIPv6(t *testing.T) {
+	freshBlocker(t)
+	defer func(old []string) { allowedHosts = old }(allowedHosts)
+	allowedHosts = nil
+	proxied := false
+	h := newHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxied = true }))
+	do := func(ip string, cookies ...string) *httptest.ResponseRecorder {
+		proxied = false
+		r := httptest.NewRequest("GET", "/x", nil)
+		r.RemoteAddr = "[" + ip + "]:1234"
+		r.Header.Set("Accept", "text/html")
+		for _, v := range cookies {
+			r.AddCookie(&http.Cookie{Name: cookieName, Value: v})
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+	if rec := do("2001:db8:5:6::1", "junk"); rec.Code != http.StatusForbidden || !blk.blocked("2001:db8:5:6::1") {
+		t.Fatalf("bad_cookie: %d", rec.Code)
+	}
+	if _, ok := blk.m["2001:db8:5:6::/64"]; !ok {
+		t.Errorf("table %v", blk.m)
+	}
+	rec := do("2001:db8:5:6:1:2:3:4")
+	if rec.Code != http.StatusForbidden || rec.Header().Get("Connection") != "close" || proxied {
+		t.Errorf("same /64: %d %q", rec.Code, rec.Header().Get("Connection"))
+	}
+	if rec := do("2001:db8:5:7::1"); rec.Code != http.StatusFound {
+		t.Errorf("other /64: %d", rec.Code)
+	}
+	// ULA（例如路由器 NAT 後的位址）照樣 403，但不封鎖
+	if rec := do("fd17::1", "junk"); rec.Code != http.StatusForbidden || len(blk.m) != 1 {
+		t.Errorf("ula bad_cookie: %d entries=%d", rec.Code, len(blk.m))
+	}
+	if rec := do("fd17::1"); rec.Code != http.StatusFound {
+		t.Errorf("ula after bad_cookie: %d", rec.Code)
+	}
+}
+
+// 最長的項目 × blocklistMax 仍須小於 RouterOS /tool/fetch 的 64512 bytes
+func TestBlocklistWorstSize(t *testing.T) {
+	now := freshBlocker(t)
+	for i := range blocklistMax + 10 {
+		k := fmt.Sprintf("ffff:ffff:ffff:%04x::/64", 0xf000+i)
+		blk.m[k] = &offender{until: now.Add(strikeWindow), strikes: 999, event: "verify_fail"}
+	}
+	rec := httptest.NewRecorder()
+	serveBlocklist(rec, httptest.NewRequest("GET", "/blocklist.json", nil))
+	body := rec.Body.String()
+	// ttl 相同時截斷留下哪幾筆依 map 順序而定；每筆長度相同，只檢查格式
+	if !regexp.MustCompile(`\[\{"ip":"ffff:ffff:ffff:f[0-9a-f]{3}::/64","ttl":604800,"event":"verify_fail","strike":999\},`).MatchString(body) {
+		t.Fatalf("unexpected item format: %.200s", body)
+	}
+	if n := strings.Count(body, `"ip"`); n != blocklistMax {
+		t.Fatalf("items %d", n)
+	}
+	if len(body) >= 64512 {
+		t.Errorf("worst-case blocklist %d bytes >= 64512", len(body))
+	}
+	t.Logf("worst-case blocklist: %d bytes", len(body))
 }
 
 func TestStrictSNI(t *testing.T) {

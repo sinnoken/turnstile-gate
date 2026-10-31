@@ -35,8 +35,8 @@ Turnstile 元件端的錯誤（例如 `110200` 網域未授權）不會產生 to
 - 7 天視窗以「最後一次被封鎖」起算：距離上次封鎖超過 7 天，次數歸零。
 - 封鎖期間再觸發事件不會重複加重。
 - 觸發封鎖的那次 `verify_fail` 仍照常導回驗證頁（`?err=1`）並關閉連線，封鎖從下一個請求／連線開始生效。
-- **私有、loopback、link-local IP 永不封鎖**（例如 `192.168.x.x`、`10.x.x.x`、`172.16.x.x`～`172.31.x.x`、`127.0.0.1`、`169.254.x.x`）：事件照樣記錄，只是不封。從家裡用內網連線測試不會把自己鎖在外面。CGNAT 位址（`100.64.0.0/10`）不在此列。
-- 閘門端（A）IPv4、IPv6 都會封鎖；`/blocklist.json` 只列 IPv4，路由器端（B）只處理 IPv4。
+- **封鎖單位**：IPv4 是單一位址；IPv6 是整個 `/64` 前綴（例如 `2001:db8:1:2::/64`），因為同一個用戶端可以在自己的 `/64` 內任意換位址。同一 `/64` 內的任一位址觸發事件，整個 `/64` 一起封鎖、一起累計次數。閘門端（A）與路由器端（B）都以這個單位處理。代價是同一 `/64` 內的其他裝置會一起被封，風險與 IPv4 的 NAT／CGNAT 相同（家中多台裝置、公共 Wi-Fi、VPN 或 iCloud Private Relay 的出口）。
+- **私有、loopback、link-local IP 永不封鎖**：IPv4 例如 `192.168.x.x`、`10.x.x.x`、`172.16.x.x`～`172.31.x.x`、`127.0.0.1`、`169.254.x.x`；IPv6 為 `fc00::/7`（ULA）、`fe80::/10`（link-local）、`::1`，以及 IPv4-mapped 形式（`::ffff:192.168.x.x` 等）的私有 IPv4。事件照樣記錄，只是不封。從家裡用內網連線測試不會把自己鎖在外面。CGNAT 位址（`100.64.0.0/10`）不在此列。
 - 門檻與時長寫死在程式常數，不開環境變數。
 
 ## 兩層封鎖
@@ -67,17 +67,19 @@ GET /blocklist.json      Cache-Control: no-store；只接受 GET
 ```json
 {"generated":"2026-10-31T09:00:00Z","items":[
   {"ip":"203.0.113.50","ttl":3540,"event":"bad_cookie","strike":1},
-  {"ip":"198.51.100.7","ttl":86100,"event":"verify_fail","strike":2}
+  {"ip":"198.51.100.7","ttl":86100,"event":"verify_fail","strike":2},
+  {"ip":"2001:db8::/64","ttl":3540,"event":"bad_cookie","strike":1}
 ]}
 ```
 
 | 欄位 | 說明 |
 |---|---|
-| `items` | **只列目前封鎖中的 IPv4**；累犯紀錄與 IPv6 不輸出 |
+| `items` | **只列目前封鎖中的項目**；累犯紀錄不輸出 |
+| `ip` | IPv4 是單一位址；IPv6 是 `/64` 前綴（含 `/64`）。路由器依是否含 `:` 寫進 `/ip` 或 `/ipv6` 的 address-list |
 | `ttl` | 剩餘秒數（整數），路由器直接當 address-list 的 `timeout` |
 | `event`、`strike` | 給人看，寫進 address-list 的 comment；路由器不據此判斷 |
 
-RouterOS `/tool/fetch output=user` 最多讀回 64512 bytes（63 KiB），超過的部分**直接截斷、不報錯**（RouterOS 手冊 `/tool/fetch` 與 Fetch 指南）。因此清單上限 800 筆（程式常數 `blocklistMax`；每筆最長約 72 bytes，800 筆約 58 KB），超過時只輸出 `ttl` 最長的前 800 筆，並記一行 `blocklist truncated` warn（欄位 `items`、`max`）。非 GET 回 `405`，其他路徑回 `404`；沒有封鎖中的 IP 時 `items` 是空陣列 `[]`。
+RouterOS `/tool/fetch output=user` 最多讀回 64512 bytes（63 KiB），超過的部分**直接截斷、不報錯**（RouterOS 手冊 `/tool/fetch` 與 Fetch 指南）。因此清單上限 700 筆（程式常數 `blocklistMax`，依最長的 IPv6 項目計算，滿額時整份 JSON 仍小於 64512 bytes），超過時只輸出 `ttl` 最長的前 `blocklistMax` 筆，並記一行 `blocklist truncated` warn（欄位 `items`、`max`）。非 GET 回 `405`，其他路徑回 `404`；沒有封鎖中的 IP 時 `items` 是空陣列 `[]`。
 
 ## 日誌
 
@@ -89,6 +91,8 @@ RouterOS `/tool/fetch output=user` 最多讀回 64512 bytes（63 KiB），超過
 | `info`（預設） | 事件（`event`）、啟動（`start`、`blocklist`）、關閉（`shutdown`）、憑證載入（`certificate loaded`）、每小時一行表格大小（`table`） |
 | `warn` | 封鎖（`blocked`，`duration` 為 `1h0m0s`、`24h0m0s`、`168h0m0s`）、表滿無法新增（`table full`）、封鎖清單被截斷（`blocklist truncated`）、同時設了 `UPSTREAM_SERVER_NAME` 與 `UPSTREAM_INSECURE`（`UPSTREAM_SERVER_NAME 已設定，忽略 UPSTREAM_INSECURE`） |
 | `error` | siteverify 連線或設定錯誤（`siteverify`）、上游錯誤（`upstream`；用戶端自己中斷的只記 `debug`）、憑證重新載入失敗（`reload cert failed, keep old`）、啟動失敗後結束（`config`、`listen`、`load cert`、`blocklist listen`、`blocklist serve`、`serve`，原因在 `err` 欄位） |
+
+`blocked`、`table full` 的 `ip` 欄位是封鎖單位（IPv6 為 `/64` 前綴）；`event`、`request`、`dropped`、`misdirected`、`sni rejected`、`siteverify` 的 `ip` 是用戶端實際位址。
 
 預設等級下被掃描也不會洗掉 `/log`：沒有 cookie 的請求、SNI 與 `Host` 不符都不記錄。`debug` 只在排查問題時短暫開啟。
 
@@ -105,8 +109,9 @@ RouterOS `/tool/fetch output=user` 最多讀回 64512 bytes（63 KiB），超過
 # 閘門日誌：事件與封鎖
 /log/print where topics~"container" message~"\"msg\":\"(event|blocked)\""
 
-# 路由器端 address-list（comment 是 gate: <事件> #<次數>）
+# 路由器端 address-list（comment 是 gate: <事件> #<次數>）；IPv6 的 /64 在 /ipv6 底下
 /ip/firewall/address-list/print where list=gate-block
+/ipv6/firewall/address-list/print where list=gate-block
 
 # 直接看閘門的清單（只在路由器上執行；9090 不對其他主機開放）
 :put ([/tool/fetch url="http://172.17.0.2:9090/blocklist.json" output=user as-value]->"data")
@@ -129,8 +134,10 @@ RouterOS `/tool/fetch output=user` 最多讀回 64512 bytes（63 KiB），超過
 
    ```
    /ip/firewall/address-list/remove [find list=gate-block address=203.0.113.50]
+   /ipv6/firewall/address-list/remove [find list=gate-block address=2001:db8:1:2::/64]
    # 全部清掉
    /ip/firewall/address-list/remove [find list=gate-block]
+   /ipv6/firewall/address-list/remove [find list=gate-block]
    ```
 
 順序：先重啟閘門再刪路由器項目；反過來的話，路由器下一分鐘會從閘門重新拉回來。
