@@ -96,8 +96,10 @@ docker run -d --name turnstile-gate -p 8443:8443 \
 | 路徑 | 說明 |
 |---|---|
 | `GET /__gate` | 驗證頁 |
-| `POST /__gate/verify` | 接收 token、呼叫 siteverify、發 cookie |
-| 其他 | 有效 cookie → 轉發；否則瀏覽器導向驗證頁、其他請求回 `401` |
+| `POST /__gate/verify` | 接收 token、呼叫 siteverify、發 cookie（body 上限 8 KB） |
+| `GET /__gate/h.woff2` | 驗證頁標題字型 |
+| 其他 | 有效 cookie → 轉發；否則瀏覽器導向驗證頁、其他請求回 `401`。`Host` 不在 `ALLOWED_HOSTS` 回 `421` |
+| `GET /blocklist.json` | 封鎖清單，只在 `BLOCKLIST_LISTEN` 的獨立位址提供 |
 
 送往後端的請求會帶 `X-Real-IP`、`X-Forwarded-For`、`X-Forwarded-Proto`、`X-Forwarded-Host`；WebSocket 可正常轉發。
 
@@ -129,7 +131,7 @@ docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -t turnstile
 docker buildx build --platform linux/arm64 -o type=docker,dest=turnstile-gate-arm64.tar .
 ```
 
-GitHub Actions 會在推送到 `main` 時發布 `ghcr.io/sinnoken/turnstile-gate:latest`；推送 `v*` tag 時另外建立 Release，附上 `arm64`、`armv7`、`amd64` 三種 RouterOS 可直接匯入的 tar 與 SHA-256。
+GitHub Actions 會在推送到 `main` 時發布 `ghcr.io/sinnoken/turnstile-gate:latest`。推送 `v*` tag 時另外發布版本映像（例：`:1.0.0`，可用來[退回舊版](docs/deploy-mikrotik.md#退回舊版)），並建立 [Release](https://github.com/sinnoken/turnstile-gate/releases)，附上 `arm64`、`armv7`、`amd64` 三種 RouterOS 可直接匯入的 tar 與 SHA-256。
 
 ## 限制
 
